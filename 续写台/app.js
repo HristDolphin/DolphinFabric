@@ -1568,7 +1568,6 @@ function wsMask(show){ const _m = el("wsMask"); if(_m){ _m.style.display = (show
   //       v2Toast(devSG.checked ? "在线过滤已开启：在线模式下⚠️条目等同关闭" : "在线过滤已关闭：⚠️条目恢复原设置", devSG.checked ? "ok" : "err");
   //     };
   //   }
-  */
   // 词库管理：转化入口
   const ruleBuild = el("ruleBuild");
   if(ruleBuild) ruleBuild.onclick = buildUserRule;
