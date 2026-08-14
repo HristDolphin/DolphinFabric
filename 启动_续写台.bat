@@ -1,4 +1,5 @@
-﻿@echo off
+@echo off
+chcp 65001 >nul
 cd /d "%~dp0"
 set "PY=%~dp0python\portable\python.exe"
 if not exist "%PY%" (
@@ -7,8 +8,8 @@ if not exist "%PY%" (
   pause
   exit /b 1
 )
-echo Starting DolphinFabric (海豚编文台) - LAN/phone address printed below
-echo Press Ctrl+C in this window to stop, or close the window.
+echo Starting DolphinFabric（海豚编文台）...
+echo LAN/phone address printed below; Ctrl+C to stop.
 start "" "http://127.0.0.1:8003/"
 "%PY%" serve.py xietai --port 8003
 pause
