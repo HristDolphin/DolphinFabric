@@ -1,0 +1,29 @@
+# SafeGate 运行时状态（含用户标记，不入库）
+safeGate.json
+
+# 用户本地哈希集（明文词库也放这里，勿提交）
+rules/user/
+
+# 明文词表/下载源存档（哈希库重建用，勿提交）
+tools/raw_dicts/
+tools/*.txt
+
+# Python
+__pycache__/
+*.pyc
+
+# 备份与临时
+_backup_*/
+
+servercfg.json
+
+# 开发备份(不入库)
+续写台/archives/
+
+# 运行数据(启动时自动重建,不入库)
+_index.json
+_global.json
+Universes/
+works/
+WorldBook/
+lorebooks/

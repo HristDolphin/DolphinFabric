@@ -1,0 +1,21 @@
+{
+ "cat": "reactionary",
+ "label": "政治类",
+ "buckets": {
+  "2": [
+   "d72c4a659e08a1e4"
+  ],
+  "3": [
+   "098b8d04d9df3d8e",
+   "274faed3db09652b"
+  ],
+  "4": [
+   "0feca4519b6f50e3",
+   "4b9a2ea2e5068a8f"
+  ],
+  "6": [
+   "3061e882087ef230",
+   "f41bfe9e197fde2f"
+  ]
+ }
+}

@@ -1,0 +1,472 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="theme-color" content="#0c0c12" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="续写台" />
+<title>DolphinFabric · 海豚编文台</title>
+<link rel="stylesheet" href="styles.css" />
+<link rel="manifest" href="manifest.json" />
+<link rel="apple-touch-icon" href="icon-192.png" />
+<link rel="icon" href="data:," />
+<script>
+/* 刷新首帧直接显示上次页面(无工作台轮廓):同步读 lastnav → html 加类 → CSS 首帧即目标页 */
+(function(){
+  try{
+    var _ln = JSON.parse(localStorage.getItem("xietai.lastnav.v1") || "null") || {};
+    if(_ln.page && _ln.page !== "workbench") document.documentElement.classList.add("restore-" + _ln.page);
+  }catch(e){}
+})();
+</script>
+</head>
+<body>
+<div class="app">
+
+  <!-- 顶栏 -->
+  <header class="topbar">
+    <nav class="topbar-nav">
+      <button id="mobNavBtn" class="icon-btn mob-only" title="页面菜单">☰</button>
+      <span id="mobPageTitle" class="mob-only">工作台</span>
+      <button class="page-nav-btn active" data-page="workbench">工作台</button>
+      <button class="page-nav-btn" data-page="universe">世界管理</button>
+      <button class="page-nav-btn" data-page="prompt">提示词工具</button>
+    </nav>
+    <div class="top-right">
+      <button id="mobModelBtn" class="icon-btn mob-only" title="选择模型">◈</button>
+      <select id="modelSel"><option>加载中…</option></select>
+      <span id="connHint" class="hint">检测中</span>
+      <button id="openParams" class="icon-btn" title="模型参数">🎚</button>
+      <button id="mobUniBtn" class="icon-btn mob-only" title="平行宇宙（当前宇宙的世界书）">🌏</button>
+      <button id="syncBtn" class="icon-btn" title="同步">☁</button>
+      <span id="syncStatus" class="sync-status"></span>
+      <button id="openCfg" class="icon-btn">⚙</button>
+    </div>
+  </header>
+
+  <!-- v2 宇宙/作品集导航栏（Phase 2c 重构：宇宙 = Universes；全局|世界传说居中） -->
+  <nav class="v2-bar">
+    <div class="v2-bar-group v2-bar-left">
+      <span class="v2-label">宇宙</span>
+      <select id="v2WorldBar" class="v2-sel"><option>无宇宙</option></select>
+      <button id="v2NewWorld" class="v2-mini">＋</button>
+      <button id="v2ManageWorldBar" class="v2-mini" title="世界管理">⚙</button>
+      <span class="v2-label v2-label-sep">作品集</span>
+      <select id="v2ProjectBar" class="v2-sel"><option>无作品集</option></select>
+      <button id="v2NewProject" class="v2-mini">＋</button>
+    </div>
+    <select id="styleSel" class="v2-sel v2-style-sel" title="选择文风"><option>加载中…</option></select>
+    <button id="v2GlobalBtn" class="v2-mini v2-global" title="全局激活"><span class="m-icon">🌐</span><span class="m-text">全局|世界传说</span></button>
+    <button id="openSys" class="v2-mini" title="系统设置"><span class="m-icon">🧰</span><span class="m-text">系统</span></button>
+    <div class="v2-bar-group v2-bar-right">
+      <span class="v2-label">章节</span>
+      <select id="v2ChapterBar" class="v2-sel"><option>无章节</option></select>
+      <button id="v2NewChapter" class="v2-mini">＋</button>
+      <button id="v2RenameChapter" class="v2-mini" disabled>✎</button>
+    </div>
+    <!-- 全局|世界传说 灰框（向下弹出） -->
+    <div id="v2GlobalPop" class="v2-global-pop">
+      <div class="v2-pop-title">全局激活的世界书</div>
+      <div class="v2-pop-hint">点气泡定位 · ✕ 移除 · 空白展开候选</div>
+      <div id="v2GlobalPops" class="v2-pop-pops"></div>
+      <div id="v2GlobalCands" class="v2-pop-cands"></div>
+    </div>
+  </nav>
+
+  <!-- 预留页占位（宇宙管理） -->
+  <div id="pagePlaceholder" class="prompt-page" style="display:none">
+    <div class="prompt-head">
+      <strong>世界管理</strong>
+      <div class="prompt-actions">
+        <button id="wmNewWorldPage" class="mini-btn">＋ 新建宇宙</button>
+      </div>
+    </div>
+    <div class="wm-tabs mob-only">
+      <button id="wmTabWb" class="wm-tab on">WorldBook 编辑</button>
+      <button id="wmTabUni" class="wm-tab">宇宙管理</button>
+    </div>
+    <div class="wm-split">
+      <div class="wm-wb-pane">
+        <div class="wm-wb-head">WorldBook 编辑 <small>条目卡片可行内编辑；点 ⛲ 放大编辑</small></div>
+        <div id="wmWbBody" class="wm-wb-body"></div>
+      </div>
+      <div class="wm-universe-pane">
+        <div class="wm-wb-head">宇宙管理 <small>宇宙 → 作品集 → 章节</small></div>
+        <div id="wmBodyPage" class="wm-body"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 放大编辑弹窗 -->
+  <div id="wbZoomSheet" class="sheet">
+    <div class="card wb-zoom-card">
+      <div class="wm-head">
+        <h3>放大编辑条目</h3>
+        <div class="wm-actions"><button id="wbZoomClose" class="mini-btn ghost">关闭</button></div>
+      </div>
+      <div class="wb-zoom-form">
+        <label>标题 <input id="wbZoomTitle" class="name-input"></label>
+        <label>主触发词（逗号分隔） <input id="wbZoomKeys" class="name-input" placeholder="关键词, 逗号分隔"></label>
+        <label>注入内容</label>
+        <textarea id="wbZoomBody" class="wb-zoom-body" placeholder="注入AI的条目信息…"></textarea>
+        <div class="wb-zoom-actions">
+          <button id="wbZoomSave" class="btn primary">保存</button>
+          <button id="wbZoomClose2" class="btn">取消</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 提示词工具页（首个功能：风格预设编辑） -->
+  <div id="promptPage" class="prompt-page" style="display:none">
+    <div class="prompt-head">
+      <strong>提示词工具 · 风格预设</strong>
+      <div class="prompt-actions">
+        <button id="styleAdd" class="mini-btn">＋ 新建风格</button>
+        <button id="styleReset" class="mini-btn">恢复内置</button>
+      </div>
+    </div>
+    <div id="styleList" class="style-list"></div>
+
+    <div class="prompt-head" style="margin-top:10px">
+      <strong>提示词条目</strong>
+      <div class="prompt-actions">
+        <button id="piAdd" class="mini-btn">＋ 新建条目</button>
+      </div>
+    </div>
+    <div id="piList" class="style-list"></div>
+
+    <!-- 词库管理（第二栏：安全闸门哈希库） -->
+    <div class="prompt-head" style="margin-top:10px">
+      <strong>词库管理</strong>
+    </div>
+    <div id="ruleList" class="rule-list"></div>
+    <div class="rule-build">
+      <div class="rule-build-fields">
+        <input id="ruleCat" class="wi-title" placeholder="类别 cat（字母/数字/_，如 gamble）" spellcheck="false">
+        <input id="ruleLabel" class="wi-title" placeholder="中文标签（如 赌博）" spellcheck="false">
+      </div>
+      <textarea id="ruleWords" rows="4" placeholder="词表：每行一个词，# 开头为注释；同类别重复转化会自动合并"></textarea>
+      <div><button id="ruleBuild" class="mini-btn">转化并启用</button></div>
+    </div>
+
+    <!-- 开发者设置已隐藏(发布版): 在线过滤默认开启不可关闭
+        <div class="prompt-head dev-head" style="margin-top:10px">
+          <strong>开发者设置</strong>
+        </div>
+        <div class="dev-settings">
+          <label class="dev-setting">
+            <input type="checkbox" id="devSafeGate">
+            <span><b>在线过滤（SafeGate）</b><br><small>关闭后，在线模式下 ⚠️标记条目不再等同关闭（恢复原设置）；已存在的红框标记仍会在 UI 显示</small></span>
+          </label>
+        </div>
+    -->
+  </div>
+
+  <!-- 参数面板（弹窗，由 🎚 拉起） -->
+  <div id="paramSheet" class="sheet">
+    <div class="card param-card">
+      <div class="pp-head">
+        <strong>模型配置</strong>
+        <span id="presetHint" class="hint">未匹配预设</span>
+        <button id="closeParams" class="icon-btn">×</button>
+      </div>
+
+      <div class="pp-section">
+        <div class="pp-sec-title">① 采样参数</div>
+        <div class="pp-grid">
+          <label>温度 temperature<input id="pTemperature" type="range" min="0" max="2" step="0.05"><output id="oTemperature">0.8</output></label>
+          <label>top_p<input id="pTopP" type="range" min="0" max="1" step="0.01"><output id="oTopP">0.9</output></label>
+          <label>top_k<input id="pTopK" type="range" min="0" max="100" step="1"><output id="oTopK">40</output></label>
+          <label>repeat_penalty<input id="pRepeat" type="range" min="1" max="1.5" step="0.01"><output id="oRepeat">1.1</output></label>
+          <label>min_p<input id="pMinP" type="range" min="0" max="0.5" step="0.01"><output id="oMinP">0.05</output></label>
+          <label>max_tokens<input id="pMaxTok" type="range" min="100" max="4000" step="50"><output id="oMaxTok">900</output></label>
+        </div>
+        <div class="pp-actions">
+          <button id="presetManual" class="mini-btn">调参手册</button>
+          <button id="presetSave" class="mini-btn" title="将当前参数存为本模型预设（自动按模型记忆）">存为预设</button>
+          <button id="presetDefault" class="mini-btn">恢复默认</button>
+        </div>
+      </div>
+
+      <div class="pp-section">
+        <div class="pp-sec-title">② 上下文模板</div>
+        <select id="tplSel" class="tpl-sel"></select>
+        <div class="hint" id="tplHint"></div>
+      </div>
+
+      <div class="pp-actions pp-foot">
+        <button id="saveModelCfg" class="btn primary" title="把当前模板/参数绑定到本模型（系统提示词已全局化，不随模型）">保存为本模型配置</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 系统设置弹层（系统提示词全局生效，不随模型重置） -->
+  <div id="sysSheet" class="sheet">
+    <div class="card param-card">
+      <div class="pp-head">
+        <strong>系统设置</strong>
+        <span class="hint">全局生效，不随模型切换重置</span>
+        <button id="closeSys" class="icon-btn">×</button>
+      </div>
+      <div class="pp-section">
+        <div class="pp-sec-title">系统提示词</div>
+        <textarea id="sysPrompt" class="sys-edit" placeholder="写给模型的系统提示词…">加载中</textarea>
+      </div>
+      <div class="pp-actions pp-foot">
+        <button id="saveSys" class="btn primary">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 主区 -->
+  <main class="main">
+
+    <!-- 左侧：世界浏览器（宇宙→作品→章节 下钻） -->
+    <aside id="v2WorldPanel" class="sidebar v2-panel open">
+      <div class="side-head">
+        <strong>世界浏览器</strong>
+        <div class="v2-panel-head-btns">
+          <button id="v2NewWorldSB" class="v2-mini" title="新建世界(如:缘梦宇宙)">＋</button>
+          <button id="v2NewProjectSB" class="v2-mini mob-only" title="新建书籍(作品集)">📕</button>
+          <button id="v2NewChapterSB" class="v2-mini mob-only" title="新建章节">📄</button>
+          <button id="v2PanelToggle" class="icon-btn">☰</button>
+        </div>
+      </div>
+      <div class="v2-search-row">
+        <input id="v2WorldSearch" class="v2-search" placeholder="🔍 搜索宇宙/作品/章节…" />
+      </div>
+      <div id="v2WorldBrowser" class="v2-panel-body"></div>
+    </aside>
+    <!-- 折叠态常驻的展开入口（面板外，永远可见） -->
+    <button class="v2-collapsed-tab show" id="v2PanelToggle2" title="展开世界浏览器">»</button>
+
+    <!-- 历史版本面板（左抽屉，覆盖式，默认收起） -->
+    <aside id="historyPanel" class="sidebar history">
+      <div class="side-head">
+        <strong>历史版本</strong>
+        <span class="hint">点选复用</span>
+      </div>
+      <div class="hist-search-row">
+        <input id="histSearch" class="hist-search" placeholder="🔍 搜索历史…" />
+        <button id="histClear" class="hist-clear" title="清空历史（保留当前正文）">清空</button>
+      </div>
+      <div id="historyList" class="pool-list"></div>
+    </aside>
+
+    <section class="editor-wrap">
+      <div class="editor-head">
+        <input id="curName" class="name-input" />
+        <select id="mobChapterBar" class="mob-chapter-sel"></select>
+        <span id="charCount" class="hint">0 字</span>
+        <button id="togglePreview" class="icon-btn">⬇</button>
+        <button id="toggleThink" class="icon-btn" title="思考面板（移动端为折叠预览）">🧠</button>
+        <button id="safeBtn" class="icon-btn" title="一键安全：把正文敏感内容替换为安全表述">🛡</button>
+        <button id="togglePool" class="icon-btn" title="设定池">☰</button>
+      </div>
+      <div class="editor-body">
+        <textarea id="editor" placeholder="把前文贴进来，点「续写」或按 Ctrl+Enter。新内容会追加在末尾。"></textarea>
+        <div id="gateHint" class="gate-hint" style="display:none"></div>
+        <!-- 新用户引导:未选择章节时纯色遮挡正文区,引导创建流程 -->
+        <div id="guideOverlay" class="guide-overlay" style="display:none">
+          <div class="guide-card">
+            <div class="guide-title">欢迎使用续写台</div>
+            <div class="guide-sub">三步创建你的第一个世界</div>
+            <div class="guide-step" id="guideStepUni">
+              <span class="gs-num">1</span>
+              <div class="gs-body">
+                <div class="gs-name">创建宇宙</div>
+                <div class="gs-desc">宇宙是你的世界观容器，可绑定世界书</div>
+                <button class="mini-btn gs-btn" id="guideNewUni">＋ 新建宇宙</button>
+              </div>
+            </div>
+            <div class="guide-step" id="guideStepWork">
+              <span class="gs-num">2</span>
+              <div class="gs-body">
+                <div class="gs-name">创建作品集</div>
+                <div class="gs-desc">作品集存放你的章节</div>
+                <button class="mini-btn gs-btn" id="guideNewWork">＋ 新建作品集</button>
+              </div>
+            </div>
+            <div class="guide-step" id="guideStepChap">
+              <span class="gs-num">3</span>
+              <div class="gs-body">
+                <div class="gs-name">新建章节</div>
+                <div class="gs-desc">开始写作正文</div>
+                <button class="mini-btn gs-btn" id="guideNewChap">＋ 新建章节</button>
+              </div>
+            </div>
+            <div class="guide-hint">也可从左侧「世界浏览器」或顶部导航操作</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 右侧：世界设定 + 设定集/设定书列表（取代旧设定池） -->
+    <!-- 右抽屉折叠态入口(移动端,与左标签对称) -->
+    <button class="pool-tab show" id="poolTab" title="展开世界设定">📖</button>
+
+    <aside id="sidebar" class="sidebar">
+      <div class="side-head">
+        <strong id="wsHead">世界设定</strong>
+        <button id="wsClose" class="icon-btn ws-close">✕</button>
+        <button id="v2ManageWorld" class="icon-btn" title="平行世界管理">⚙</button>
+      </div>
+      <div id="v2WorldSettingsBody" class="v2-panel-body"></div>
+    </aside>
+  </main>
+
+  <!-- 移动端设定池遮罩(点击关闭抽屉) -->
+  <div id="wsMask" class="ws-mask" style="display:none"></div>
+
+  <!-- 思考 / 草稿面板 -->
+  <section id="thinkPanel" class="think-panel">
+    <div id="thinkBlock" class="tp-block">
+      <pre id="thinkText" class="think-text"></pre>
+    </div>
+    <div class="draft-zone">
+      <div class="draft-main">
+        <textarea id="draftText" class="draft-text" placeholder="生成结果会显示在这里，可直接修改；满意后点「插入正文」。"></textarea>
+      </div>
+      <div class="draft-actions">
+        <span id="draftStatus" class="hint draft-status-v"></span>
+        <button id="clearThink" class="mini-btn"><span class="m-icon">🧹</span><span class="m-text">清空思考</span></button>
+        <button id="discardBtn" class="btn ghost"><span class="m-icon">✕</span><span class="m-text">放弃</span></button>
+        <button id="regenBtn" class="btn ghost"><span class="m-icon">⟳</span><span class="m-text">重新生成</span></button>
+        <button id="acceptBtn" class="btn primary" disabled><span class="m-icon">✓</span><span class="m-text">插入正文</span></button>
+        <!-- 移动端三键:重做|修改|继续 -->
+        <button id="mobRedo" class="btn primary mob-draft">重做</button>
+        <button id="mobEdit" class="btn primary mob-draft">修改</button>
+        <button id="mobCont" class="btn primary mob-draft">继续</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- 底栏 -->
+  <footer class="composer">
+    <div class="seg" id="modeSeg" title="切换续写策略">
+      <select id="modeSel" class="seg-select" title="切换续写策略">
+        <option value="chat">续写</option>
+        <option value="complete">代笔</option>
+        <option value="completion">补全</option>
+      </select>
+    </div>
+    <input id="instruction" class="instr" placeholder="续写指令（可选）：例如「让男主在此处出场，节奏放缓」" />
+    <button id="genBtn" class="btn primary gen-chat">续写</button>
+    <div class="composer-btns">
+      <button id="undoBtn" class="btn ghost" title="撤销上次续写"><span class="m-icon">↩</span><span class="m-text">撤销</span></button>
+      <button id="viewReqBtn" class="btn ghost" title="查看实际发给 API 的内容"><span class="m-icon">👁</span><span class="m-text">查看请求</span></button>
+      <button id="toggleHistory" class="btn ghost" title="历史版本（左抽屉）"><span class="m-icon">🕘</span><span class="m-text">历史</span></button>
+    </div>
+  </footer>
+</div>
+
+<!-- 查看请求弹层 -->
+<div id="reqSheet" class="sheet">
+  <div class="card req-card">
+    <h3>实际发给 API 的内容</h3>
+    <label>模型 / 参数</label>
+    <textarea id="reqModel" class="cfg-in" rows="1" readonly></textarea>
+    <textarea id="reqOpts" class="cfg-in" rows="1" readonly></textarea>
+    <label>System（系统提示）</label>
+    <textarea id="reqSys" class="cfg-in req-body" readonly></textarea>
+    <label id="reqUserLabel">User（用户提示 = 设定+前文窗口+指令）</label>
+    <textarea id="reqUser" class="cfg-in req-body" readonly></textarea>
+    <button id="closeReq" class="btn primary" style="margin-top:14px">关闭</button>
+  </div>
+</div>
+
+<!-- 调参手册弹层 -->
+<div id="manualSheet" class="sheet">
+  <div class="card manual-card">
+    <h3>调参手册</h3>
+    <p>这些滑块是 Ollama 的 <b>采样参数</b>，控制生成“随机度”与“守规矩程度”。改完即时生效，发给模型的请求会带上当前值。</p>
+    <ul class="manual-list">
+      <li><b>temperature（温度，0–2）</b>：越高越发散/有惊喜，越低越稳/越死板。文学创作 0.7–1.1；事实/代码 0.2–0.5。</li>
+      <li><b>top_p（0–1）</b>：只从累计概率 ≤ 该值的词里选。0.9 常用。和 temperature 二选一调即可，别同时拉满。</li>
+      <li><b>top_k（0–100）</b>：只从概率最高的 K 个词里选。0=不限制。40 通用，角色扮演可调高到 60–80。</li>
+      <li><b>repeat_penalty（1–1.5）</b>：惩罚重复。1.1 通用；模型爱复读就调到 1.2–1.3。</li>
+      <li><b>min_p（0–0.5）</b>：低于（最高概率×min_p）的词直接淘汰，过滤垃圾词。0.05–0.1 常用。</li>
+      <li><b>max_tokens（100–4000）</b>：单次最多生成多少 token。长续写调到 1500+。</li>
+    </ul>
+    <p class="hint">参数随模型记忆</p>
+    <button id="closeManual" class="btn primary" style="margin-top:10px">知道了</button>
+  </div>
+</div>
+
+<!-- 平行世界管理面板（独立面板） -->
+<div id="worldManagerSheet" class="sheet">
+  <div class="card wm-card">
+    <div class="wm-head">
+      <h3>平行世界管理</h3>
+      <div class="wm-actions">
+        <button id="wmNewWorld" class="mini-btn">＋ 新建宇宙</button>
+        <button id="wmMergeLegacy" class="mini-btn">合并浏览器旧文章</button>
+        <button id="wmClose" class="mini-btn ghost">关闭</button>
+      </div>
+    </div>
+    <div class="wm-hint">此处管理作品集与章节（与对应的书/设定集绑定）。不编辑全局或世界设定本身。</div>
+    <div id="wmBody" class="wm-body"></div>
+  </div>
+</div>
+
+<div id="cfgSheet" class="sheet">
+  <form id="cfgForm" class="card" onsubmit="return false">
+    <h3>配置</h3>
+    <label>后端模式</label>
+    <select id="cfgBackend" class="cfg-in">
+      <option value="local">本地 Ollama</option>
+      <option value="online">在线 API（OpenAI 兼容）</option>
+    </select>
+    <div class="cfg-local">
+      <label>Ollama 地址（本地模式）</label>
+      <input id="cfgUrl" class="cfg-in" />
+    </div>
+    <div class="cfg-online">
+      <label>在线平台</label>
+      <select id="cfgPlatform" class="cfg-in">
+        <option value="siliconflow">硅基流动 SiliconFlow</option>
+        <option value="deepseek">DeepSeek 官方</option>
+        <option value="custom">自定义（OpenAI 兼容）</option>
+      </select>
+      <label>API Base URL（在线模式）</label>
+      <input id="cfgOnlineBase" class="cfg-in" autocomplete="off" placeholder="https://api.siliconflow.cn/v1" />
+      <label>API 密钥（仅存本浏览器，建议用完可清空）</label>
+      <input id="cfgOnlineKey" class="cfg-in" type="password" autocomplete="new-password" placeholder="sk-..." />
+    </div>
+    <label>前文窗口（字符数）</label>
+    <input id="cfgTail" class="cfg-in" type="number" />
+    <label>最大生成 token</label>
+    <input id="cfgMax" class="cfg-in" type="number" />
+    <label class="chk"><input id="cfgThink" type="checkbox" /> 保留思考块</label>
+    <label class="chk"><input id="cfgAutoSum" type="checkbox" /> 超窗口自动摘要前文（B2）</label>
+    <label class="chk"><input id="cfgScan" type="checkbox" checked /> 扫描正文触发（逻辑/向量条目按正文匹配）</label>
+    <label>界面字号</label>
+    <select id="cfgFontScale" class="cfg-in">
+      <option value="0.9375">小</option>
+      <option value="1" selected>中（默认）</option>
+      <option value="1.0625">大</option>
+      <option value="1.125">特大</option>
+    </select>
+    <div class="cfg-btns">
+      <button id="resetCfg" class="btn ghost" title="清空本地缓存的配置">重置配置</button>
+      <button id="saveCfg" class="btn primary" type="button">保存</button>
+    </div>
+  </form>
+</div>
+
+<!-- 移动端浮层:页面菜单 / 模型选择 -->
+<div id="mobNavPop" class="mob-pop" style="display:none">
+  <button data-page="workbench">工作台</button>
+  <button data-page="universe">世界管理</button>
+  <button data-page="prompt">提示词工具</button>
+</div>
+<div id="mobModelPop" class="mob-pop" style="display:none"></div>
+<div id="v2UniPop" class="v2-global-pop"></div>
+
+<script src="config.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

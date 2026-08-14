@@ -1,0 +1,31 @@
+{
+ "cat": "fraud",
+ "label": "诈骗",
+ "buckets": {
+  "2": [
+   "0dce494765ffbb82",
+   "13a5cd970d51dd07",
+   "20fb2e429f2b2abb",
+   "59670ab67938886e",
+   "a94bb704d5d03514",
+   "e48b36c7f5e9c1ad",
+   "fdf77ee77d8d8a7f"
+  ],
+  "3": [
+   "21edfa2c8ed60d9d",
+   "4928bb99c2354fe2",
+   "52f35d796c3ba1af",
+   "a41fdd21d36e51eb"
+  ],
+  "4": [
+   "26245a3c1971f929",
+   "3e65cec3aedbc262",
+   "98ec6856cfd928de",
+   "ad6eb2dae837ec2c",
+   "bf46a00a8e23ce77",
+   "c248329e3c43ffd4",
+   "e15dd71c3a09bf4d",
+   "f15be71ede59e689"
+  ]
+ }
+}

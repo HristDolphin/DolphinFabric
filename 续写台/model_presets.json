@@ -1,0 +1,18 @@
+{
+  "comment": "模型参数预设。match 为模型名子串（大小写不敏感），切换模型时自动匹配；未匹配则保留当前滑块值。match 为 \"default\" 仅作「恢复默认」按钮使用，不参与自动匹配。",
+  "defaultPreset": {
+    "label": "通用默认",
+    "params": { "temperature": 0.8, "top_p": 0.9, "top_k": 40, "repeat_penalty": 1.1, "min_p": 0.05 }
+  },
+  "presets": [
+    { "match": "deepseek-r1", "label": "DeepSeek R1 · 推理降噪", "params": { "temperature": 0.6, "top_p": 0.95, "top_k": 40, "repeat_penalty": 1.1, "min_p": 0.05 } },
+    { "match": "qwq", "label": "QwQ · 推理", "params": { "temperature": 0.7, "top_p": 0.95, "top_k": 40, "repeat_penalty": 1.05, "min_p": 0.05 } },
+    { "match": "Cydonia", "label": "Cydonia · 角色扮演", "params": { "temperature": 1.1, "top_p": 0.92, "top_k": 60, "repeat_penalty": 1.15, "min_p": 0.1 } },
+    { "match": "Deepsex", "label": "Deepsex · 创作", "params": { "temperature": 1.0, "top_p": 0.9, "top_k": 50, "repeat_penalty": 1.12, "min_p": 0.08 } },
+    { "match": "Qwen3", "label": "Qwen3 · 通用", "params": { "temperature": 0.8, "top_p": 0.9, "top_k": 40, "repeat_penalty": 1.1, "min_p": 0.05 } },
+    { "match": "Youtu", "label": "Youtu · 通用微调", "params": { "temperature": 0.85, "top_p": 0.9, "top_k": 40, "repeat_penalty": 1.1, "min_p": 0.05 } },
+    { "match": "Mistral", "label": "Mistral · 指令", "params": { "temperature": 0.7, "top_p": 0.9, "top_k": 40, "repeat_penalty": 1.1, "min_p": 0.05 } },
+    { "match": "Llama", "label": "Llama · 指令", "params": { "temperature": 0.8, "top_p": 0.9, "top_k": 40, "repeat_penalty": 1.1, "min_p": 0.05 } },
+    { "match": "mxbai-embed", "label": "Embed 模型 · 跳過", "skip": true }
+  ]
+}
