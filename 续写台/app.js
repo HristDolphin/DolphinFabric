@@ -1695,6 +1695,35 @@ function bindMobPopups(){
       mPop.style.display = "none";
     };
   }
+  const stBtn = el("mobStyleBtn"), stPop = el("mobStylePop");
+  if(stBtn && stPop){
+    const fillStylePop = ()=>{
+      const ssel = el("mobStyleSel"); if(!ssel) return;
+      ssel.innerHTML = "";
+      (state.styles||[]).forEach(p=>{
+        const o = document.createElement("option");
+        o.value = p.id; o.textContent = p.name;
+        if(p.id === state.style) o.selected = true;
+        ssel.appendChild(o);
+      });
+      const sp = el("mobSysPrompt"); if(sp) sp.value = effectiveSysPrompt();
+    };
+    stBtn.onclick = e=>{ e.stopPropagation();
+      if(navPop) navPop.style.display = "none";
+      if(mPop) mPop.style.display = "none";
+      if(stPop.style.display === "block"){ stPop.style.display = "none"; return; }
+      fillStylePop();
+      stPop.style.display = "block";
+    };
+    const ssel = el("mobStyleSel");
+    if(ssel) ssel.onchange = ()=>{ applyStyle(ssel.value, true); v2Toast("文风已切换:"+(state.styles.find(x=>x.id===ssel.value)||{}).name||ssel.value, "ok"); };
+    const ssave = el("mobStyleSave");
+    if(ssave) ssave.onclick = ()=>{
+      const sp = el("mobSysPrompt"); if(sp){ state.sysPrompt = sp.value; saveSysSettings(); }
+      stPop.style.display = "none";
+      v2Toast("系统提示词已保存(全局生效)", "ok");
+    };
+  }
   const uniBtn = el("mobUniBtn"), uniPop = el("v2UniPop");
   if(uniBtn && uniPop){
     uniBtn.onclick = async e=>{ e.stopPropagation();
@@ -1707,9 +1736,10 @@ function bindMobPopups(){
     };
   }
   document.addEventListener("click", e=>{
-    if(e.target.closest(".mob-pop") || e.target.closest("#v2UniPop") || e.target.closest("#mobNavBtn") || e.target.closest("#mobModelBtn") || e.target.closest("#mobUniBtn")) return;
+    if(e.target.closest(".mob-pop") || e.target.closest("#v2UniPop") || e.target.closest("#mobNavBtn") || e.target.closest("#mobModelBtn") || e.target.closest("#mobUniBtn") || e.target.closest("#mobStyleBtn")) return;
     if(navPop) navPop.style.display = "none";
     if(mPop) mPop.style.display = "none";
+    if(stPop) stPop.style.display = "none";
     if(uniPop) uniPop.classList.remove("open");
   });
 }

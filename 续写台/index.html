@@ -262,7 +262,8 @@
         <input id="curName" class="name-input" />
         <select id="mobChapterBar" class="mob-chapter-sel"></select>
         <span id="charCount" class="hint">0 字</span>
-        <button id="togglePreview" class="icon-btn">⬇</button>
+        <button id="mobStyleBtn" class="icon-btn mob-only" title="文风与系统提示词">🎨</button>
+<button id="togglePreview" class="icon-btn">⬇</button>
         <button id="toggleThink" class="icon-btn" title="思考面板（移动端为折叠预览）">🧠</button>
         <button id="safeBtn" class="icon-btn" title="一键安全：把正文敏感内容替换为安全表述">🛡</button>
         <button id="togglePool" class="icon-btn" title="设定池">☰</button>
@@ -335,8 +336,8 @@
         <span id="draftStatus" class="hint draft-status-v"></span>
         <button id="clearThink" class="mini-btn"><span class="m-icon">🧹</span><span class="m-text">清空思考</span></button>
         <button id="discardBtn" class="btn ghost"><span class="m-icon">✕</span><span class="m-text">放弃</span></button>
-        <button id="regenBtn" class="btn ghost"><span class="m-icon">⟳</span><span class="m-text">重新生成</span></button>
         <button id="acceptBtn" class="btn primary" disabled><span class="m-icon">✓</span><span class="m-text">插入正文</span></button>
+        <button id="regenBtn" class="btn ghost"><span class="m-icon">⟳</span><span class="m-text">重新生成</span></button>
         <!-- 移动端三键:重做|修改|继续 -->
         <button id="mobRedo" class="btn primary mob-draft">重做</button>
         <button id="mobEdit" class="btn primary mob-draft">修改</button>
@@ -465,6 +466,12 @@
   <button data-page="prompt">提示词工具</button>
 </div>
 <div id="mobModelPop" class="mob-pop" style="display:none"></div>
+<div id="mobStylePop" class="mob-pop" style="display:none">
+  <div class="mob-pop-title">文风 &amp; 系统提示词</div>
+  <select id="mobStyleSel" class="mob-style-sel"></select>
+  <textarea id="mobSysPrompt" class="mob-sys-edit" placeholder="写给模型的系统提示词…"></textarea>
+  <button id="mobStyleSave" class="btn primary">保存</button>
+</div>
 <div id="v2UniPop" class="v2-global-pop"></div>
 
 <script src="config.js"></script>
