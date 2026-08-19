@@ -1095,6 +1095,14 @@ function acceptDraft(){
   setDraftActions(false);
   undoStackPushTrim();
 }
+function collapsePreview(){
+  // 窄屏「修改」插入正文后自动收起预览区(与 togglePreview 收起分支同逻辑)
+  const p = el("thinkPanel"); if(!p || !p.classList.contains("open")) return;
+  p.classList.remove("open");
+  try{ localStorage.setItem("xietai.previewCollapsed.v1", "true"); }catch(e){}
+  const b = el("togglePreview");
+  if(b){ b.textContent = "⬆"; b.title = "恢复下方预览/思考区"; }
+}
 function discardDraft(){
   el("draftText").value = "";
   el("draftText").readOnly = true;
@@ -1390,7 +1398,7 @@ function bind(){
   el("genBtn").onclick = doGenerate;
   el("regenBtn").onclick = doGenerate;
   el("mobRedo").onclick = ()=>{ discardDraft(); doGenerate(); };                          // 重做=放弃并重新生成
-  el("mobEdit").onclick = ()=>{ acceptDraft(); setTimeout(()=>{ const _e=el("editor"); if(_e) _e.focus(); }, 60); };  // 修改=插入并呼出输入法
+  el("mobEdit").onclick = ()=>{ acceptDraft(); collapsePreview(); setTimeout(()=>{ const _e=el("editor"); if(_e) _e.focus(); }, 60); };  // 修改=插入并呼出输入法
   el("mobCont").onclick = ()=>{ acceptDraft(); doGenerate(); };                          // 继续=插入并继续生成
   el("acceptBtn").onclick = acceptDraft;
   el("discardBtn").onclick = discardDraft;
