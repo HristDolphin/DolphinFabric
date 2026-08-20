@@ -669,3 +669,19 @@ html.restore-universe .prompt-page, html.restore-prompt .prompt-page{animation:n
 .mob-sys-edit:focus{border-color:var(--accent)}
 #mobStylePop{width:min(320px,92vw);right:8px;padding:8px 10px 10px}
 #mobStylePop .btn{width:100%;margin-top:2px}
+
+/* ============ 横屏(landscape, ≤900px): 世界管理条目卡片单行化, 副触发词/逻辑进高级区 ============ */
+@media (orientation:landscape) and (max-width:900px){
+  .wm-wb-body .v2-curwb-entries{gap:4px}
+  .wm-wb-body .wi-row{padding:3px 6px;margin-bottom:4px;border-radius:8px}
+  .wm-wb-body .wi-main{gap:4px}
+  .wm-wb-body .wi-en{width:40px}
+  .wm-wb-body .wi-title{flex:0 1 90px;min-width:64px;padding:2px 5px}
+  .wm-wb-body .wi-keys{flex:0 1 90px;min-width:64px;padding:2px 5px}
+  .wm-wb-body .wi-keys2{display:none}   /* 副触发词: 已迁入高级区(wi-detail) */
+  .wm-wb-body .wi-logic{display:none}   /* 触发逻辑: 已迁入高级区(wi-detail) */
+  .wm-wb-body .wi-body{flex:1 1 110px;min-width:80px;padding:2px 5px}
+  .wm-wb-body .wi-pos{padding:2px 3px}
+  .wm-wb-body .wi-more,.wm-wb-body .wi-del,.wm-wb-body .wi-ch{padding:2px 5px}
+  .wm-wb-body .wi-detail{margin-top:3px;padding-top:3px;gap:6px}
+}

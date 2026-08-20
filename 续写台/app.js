@@ -2489,7 +2489,16 @@ function entryCardHtml(wbId, key, e){
       <button class="wi-zoom" title="放大编辑（大编辑框）">⛲</button>
       <button class="wi-del" title="删除条目">✕</button>
     </div>
-    <div class="wi-detail">
+        <div class="wi-detail">
+      <label>副触发词 <input class="wi-keys2-d" value="${esc(keys2)}" placeholder="逗号分隔" spellcheck="false"></label>
+      <label>触发逻辑
+        <select class="wi-logic-d">
+          <option value="0" ${logic===0?"selected":""}>任一命中</option>
+          <option value="1" ${logic===1?"selected":""}>非全部(反触发)</option>
+          <option value="2" ${logic===2?"selected":""}>无命中(反触发)</option>
+          <option value="3" ${logic===3?"selected":""}>全部命中</option>
+        </select>
+      </label>
       <label>模式
         <select class="wi-mode">
           <option value="logic" ${mode==="logic"?"selected":""}>逻辑(扫描)</option>
@@ -2541,9 +2550,20 @@ function bindEntryRow(row){
   if(pos) pos.onchange = ()=>{ e.position = Number(pos.value); commit(); };
   const more = row.querySelector(".wi-more");
   const det = row.querySelector(".wi-detail");
-  if(more && det) more.onclick = ()=>{ det.classList.toggle("open"); };
+  if(more && det) more.onclick = ()=>{
+    det.classList.toggle("open");
+    // 展开时同步高级区字段(横屏下行内 keys2/logic 隐藏, 以高级区为准)
+    const k2d = det.querySelector(".wi-keys2-d");
+    if(k2d) k2d.value = (e.keysecondary||[]).join(", ");
+    const ld = det.querySelector(".wi-logic-d");
+    if(ld) ld.value = String(Number(e.selectiveLogic) || 0);
+  };
   const keys2 = row.querySelector(".wi-keys2");
   if(keys2) keys2.oninput = ()=>{ e.keysecondary = keys2.value.split(/[,，]/).map(s=>s.trim()).filter(Boolean); commit(); };
+  const keys2d = row.querySelector(".wi-keys2-d");
+  if(keys2d) keys2d.oninput = ()=>{ e.keysecondary = keys2d.value.split(/[,，]/).map(s=>s.trim()).filter(Boolean); commit(); };
+  const logicd = row.querySelector(".wi-logic-d");
+  if(logicd) logicd.onchange = ()=>{ e.selectiveLogic = Number(logicd.value); commit(); };
   const modeSel = row.querySelector(".wi-mode");
   if(modeSel) modeSel.onchange = ()=>{
     const m = modeSel.value;
