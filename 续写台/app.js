@@ -10,7 +10,7 @@ const LS_PARAMS   = "xietai.params.v1";         // 上次滑块值
 const LS_PARAMOPEN= "xietai.paramopen.v1";      // 参数面板是否展开(已弃用,保留键名避免旧缓存报错)
 const LS_MODELCFG = "xietai.modelcfg.v1";     // 每模型专属配置:系统提示词/模板/参数
 const LS_MODE     = "xietai.mode.v1";        // 续写模式:chat(续写) / complete(代笔·断点直续) / completion(补全·真补全)
-const LS_STYLE    = "xietai.style.v1";      // 当前生效的风格预设 id
+// 已移除 xietai.style.v1:当前风格随服务端 prefs.json,不再存 localStorage
 const LS_STYLES   = "xietai.styles.v1";     // 风格预设库(提示词工具页编辑,localStorage 覆盖内置)
 const LS_PROMPTITEMS = "xietai.promptitems.v1"; // 提示词条目库(对齐 ST extension_prompt: role/position/depth)
 const LS_THINK_BL = "xietai.thinkblacklist.v1"; // 不支持 thinking 的模型名集合(运行时探测写入)
@@ -21,7 +21,8 @@ function applyFontScale(f){
   document.documentElement.style.setProperty("--fs-scale", v);
 }
 
-// 远程访问(手机/平板):API 请求全部经服务端 /api/proxy 转发 —— 密钥/Ollama 都在电脑端,远程设备零配置
+// 远程访问(手机/平板):外部 API 请求经服务端 /api/proxy 转发(Ollama/在线通道由电脑端代发)
+// 在线密钥不再由服务端代持:请求头由客户端自带(见 apiHeaders),服务端只做转发白名单
 const REMOTE = !!(location.hostname && location.hostname !== "localhost" && location.hostname !== "127.0.0.1");
 async function apiFetch(url, opts={}){
   if(!REMOTE) return fetch(url, opts);
@@ -49,6 +50,52 @@ async function apiFetch(url, opts={}){
 const PARAM_KEYS = ["temperature","top_p","top_k","repeat_penalty","min_p"];
 const DEFAULT_PARAMS = { temperature:0.8, top_p:0.9, top_k:40, repeat_penalty:1.1, min_p:0.05 };
 
+/* ---------------- 风格偏移层(20260916) ----------------
+ * 基准(模型层 state.params,绝对値) + 风格偏移(强度 × 方向 × 上限) = 生效参数。
+ * 三条硬规则:① 单向(风格不改写 state.params) ② 有界(±OFFSET_MAX,跨模型可移植) ③ 量化+clamp(可预测)
+ */
+function clampNum(v, lo, hi){ return Math.min(hi, Math.max(lo, v)); }
+function quantize(v, step){ const q = Math.round(v/step)*step; return Number((step < 1 ? q.toFixed(2) : q).toString()); }
+/* 单条风格的偏移向量;旧格式风格(只有 params,没有 s/dir)返回空 → 自动等价于"无偏移" */
+function styleDelta(st){
+  const out = {};
+  if(!st) return out;
+  const s = clampNum(Number(st.s) || 0, 0, 1);
+  if(!(s > 0)) return out;
+  const dir = st.dir || {};
+  const ov = st.offset || {};
+  for(const k of Object.keys(OFFSET_MAX)){
+    let d = Number(dir[k]) || 0;
+    if(ov[k] !== undefined && ov[k] !== null && ov[k] !== "") d = clampNum(Number(ov[k])/OFFSET_MAX[k], -1, 1);
+    if(!d) continue;
+    const delta = quantize(d * s * OFFSET_MAX[k], OFFSET_STEP[k]);
+    if(delta) out[k] = Number(delta.toFixed(2));
+  }
+  return out;
+}
+function activeStyle(){ return (state.style && state.style !== CUSTOM_STYLE.id) ? findStyleById(state.style) : null; }
+function currentDelta(){ return styleDelta(activeStyle()); }
+/* 长度(max_tokens)唯一来源 = 系统设置 cfg.maxTokens(参数面板的滑块也写这个字段);
+ * 模型配置/风格都不再携带 max_tokens,避免三处互相覆盖。 */
+function requestMaxTokens(){ return Number(state.cfg && state.cfg.maxTokens) || Number(CONFIG.defaultMaxTokens); }
+function stripMaxTokens(p){ if(p && typeof p === "object") delete p.max_tokens; return p; }
+/* 生效参数(生成时用这个,不要直接用 state.params):基准 + 偏移 → 量化 → clamp */
+function effectiveParams(){
+  const base = state.params || {};
+  const delta = currentDelta();
+  const out = { ...base };
+  for(const k of Object.keys(OFFSET_MAX)){
+    if(delta[k] === undefined) continue;
+    const b = Number(base[k]);
+    if(base[k] === undefined || base[k] === null || base[k] === "" || isNaN(b)) continue;
+    if((k === "top_k" || k === "min_p") && b <= 0) continue;   // 0 = 关闭,不被风格被动打开
+    const bnd = OFFSET_BOUND[k];
+    out[k] = Number(clampNum(quantize(b + delta[k], OFFSET_STEP[k]), bnd[0], bnd[1]).toFixed(2));
+  }
+  return out;
+}
+function isLegacyStyle(st){ return !!(st && st.params && st.s === undefined && !st.dir); }
+
 // 运行时状态
 const state = {
   cfg: loadJSON(LS_CONFIG, { ...CONFIG }),
@@ -62,14 +109,17 @@ const state = {
   probeTimer: null,   // 连接轮询定时器
   thinkBlacklist: new Set(loadJSON(LS_THINK_BL, [])),  // 不支持 thinking 的模型名集合
   appliedModel: null, // 已套用预设的模型(防止轮询重复覆盖手调参数)
-  params: loadJSON(LS_PARAMS, { ...DEFAULT_PARAMS, max_tokens: Number(CONFIG.defaultMaxTokens) }),
+  params: stripMaxTokens(loadJSON(LS_PARAMS, { ...DEFAULT_PARAMS })),   // 长度由 cfg.maxTokens 管
   modelCfg: loadJSON(LS_MODELCFG, {}),     // 每模型专属配置:{sysPrompt, template, params}
-  sysPrompt: (loadJSON("xietai.sysglobal.v1", null)||{}).sysPrompt || DEFAULT_SYSPROMPT,  // 全局系统提示词(不随模型重置)
+  // 需求5/6:系统提示词/风格/条目一律不读 localStorage、不回退内置;启动为空,以服务端 prefs.json 为准
+  sysPrompt: "",
   template: DEFAULT_TEMPLATE,              // 当前生效的上下文模板 key(随模型自动识别,原样)
   mode: loadJSON(LS_MODE, "chat"),         // 续写模式:chat=续写 / complete=代笔 / completion=补全
-  style: loadJSON(LS_STYLE, "custom"),     // 当前风格预设 id(影响 effectiveSysPrompt;提示词工具页可编辑)
-  styles: loadJSON(LS_STYLES, null) || JSON.parse(JSON.stringify(STYLE_PRESETS)),  // 风格预设库(编辑后存 localStorage,内置兜底;深拷贝防污染内置常量)
-  promptItems: loadJSON(LS_PROMPTITEMS, []),  // 提示词条目库:[{id,name,content,role,position,depth,enabled}]
+  style: "custom",                        // 当前风格预设 id(仅内存态;来源=服务端 prefs.json)
+  styles: [],                             // 风格预设库(需求5/6:只来自服务端,不再注入内置/本地)
+  promptItems: [],                        // 提示词条目库(同上,只来自服务端)
+  browserPrefs: { sysPrompt:"", styles:[], promptItems:[] },  // 当前 origin 的浏览器本地残留(需求2:仅展示/单条提交/清空)
+  _prefsUpdatedAt: 0,                     // 服务端 prefs.json 的 updatedAt(乐观并发校验用)
   history: [],                             // 续写历史版本:{text, ts, model}
   _pushT: null,                             // 静默推送防抖定时器
   initDone: false,                          // init 完成标记(完成后才自动推服务端)
@@ -80,7 +130,7 @@ let undoStack = [];
 
 /* ---------------- 存储 ---------------- */
 function loadJSON(k, def){ try{ const v=localStorage.getItem(k); return v?JSON.parse(v):def; }catch{ return def; } }
-// 保存当前章节到后端（防抖，避免每键击一次请求）
+// 保存当前章节到后端(防抖,避免每键击一次请求)
 let _chSaveT = null;
 function saveProjects(){
   const ch = V2.curChapter, w = V2.curWork;
@@ -91,8 +141,7 @@ function saveProjects(){
     catch(e){ console.warn("章节保存失败:", e); }
   }, 350);
 }
-function savePool(){ localStorage.setItem(LS_POOL, JSON.stringify(state.pools)); if(state.initDone) schedulePush(); }
-function schedulePush(){ clearTimeout(state._pushT); state._pushT = setTimeout(()=>{ if(state.initDone) pushToServer(true); }, 1500); }
+function savePool(){ localStorage.setItem(LS_POOL, JSON.stringify(state.pools)); }   // 20260916:V1 项目快照同步已移除
 function savePacks(){ localStorage.setItem(LS_PACKS, JSON.stringify(state.packs)); if(state.initDone) syncLorebooks(true); }
 function loadPacks(){
   const raw = loadJSON(LS_PACKS, null);
@@ -101,7 +150,7 @@ function loadPacks(){
   } else {
     return { packs:[], activePacks:[], editPackId:"" };
   }
-  // 归一化:任何畸形/旧版数据都补齐 activePacks / editPackId，防止 .includes 崩溃
+  // 归一化:任何畸形/旧版数据都补齐 activePacks / editPackId,防止 .includes 崩溃
   if(!Array.isArray(raw.activePacks)) raw.activePacks = [];
   if(!raw.packs.length){
     raw.packs = [{ id:"pack_default", name:"默认设定包", entries:[] }];
@@ -109,7 +158,7 @@ function loadPacks(){
     raw.editPackId = "pack_default";
     return raw;
   }
-  // 补齐激活列表:旧数据没有 activePacks 时，默认激活第一个包
+  // 补齐激活列表:旧数据没有 activePacks 时,默认激活第一个包
   if(!raw.activePacks.length) raw.activePacks = [raw.packs[0].id];
   // 补齐编辑中包 id
   if(!raw.editPackId || !raw.packs.some(p=>p.id===raw.editPackId)) raw.editPackId = raw.packs[0].id;
@@ -134,7 +183,7 @@ function newPack(name){
   if(!state.packs.activePacks.includes(pk.id)) state.packs.activePacks.push(pk.id);
   savePacks(); renderPoolHeader(); renderPool();
 }
-// 侧栏切换"正在编辑"的包（不改变激活状态）
+// 侧栏切换"正在编辑"的包(不改变激活状态)
 function editPackSwitch(id){
   state.packs.editPackId = id;
   renderPoolHeader(); renderPool();
@@ -183,17 +232,17 @@ function renderPoolHeader(){
 // 把当前 packs 同步到服务端 lorebooks/ 独立文件夹(无声)
 async function syncLorebooks(silent){
   try{
-    const r = await fetchWithTimeout(serverUrl().replace(/\/$/,"")+"/api/lorebooks", {
+    const r = await fetchWithTimeout(location.origin + "/api/lorebooks", {
       method:"POST", headers:{"Content-Type":"application/json"},
       body: JSON.stringify({ packs: state.packs.packs, activePacks: state.packs.activePacks, editPackId: state.packs.editPackId })
     }, 10000);
     if(!r.ok){ if(!silent) alert("设定包同步失败:"+r.status); return false; }
     return true;
-  }catch(e){ if(!silent) alert("设定包同步失败:"+describeErr(e, serverUrl())); return false; }
+  }catch(e){ if(!silent) alert("设定包同步失败:"+describeErr(e, "/api/lorebooks")); return false; }
 }
 async function pullLorebooks(){
   try{
-    const r = await fetchWithTimeout(serverUrl().replace(/\/$/,"")+"/api/lorebooks", { cache:"no-store" }, 10000);
+    const r = await fetchWithTimeout(location.origin + "/api/lorebooks", { cache:"no-store" }, 10000);
     if(!r.ok){ alert("拉取设定包失败:"+r.status); return; }
     const j = await r.json();
     if(!j.packs || !j.packs.length){ alert("服务端暂无设定包"); return; }
@@ -201,7 +250,7 @@ async function pullLorebooks(){
     state.packs = { packs: j.packs, activePacks: j.activePacks || (j.packs[0]&&j.packs[0].id?[j.packs[0].id]:[]), editPackId: j.editPackId || (j.packs[0]&&j.packs[0].id)||"" };
     savePacks(); renderPoolHeader(); renderPool();
     alert("已拉取 "+j.packs.length+" 个设定包");
-  }catch(e){ alert("拉取失败:"+describeErr(e, serverUrl())); }
+  }catch(e){ alert("拉取失败:"+describeErr(e, "/api/lorebooks")); }
 }
 
 // ---- SillyTavern 世界书 import/export ----
@@ -251,38 +300,39 @@ function exportLorebook(pack){
   return { entries };
 }
 
-function saveStyle(){ try{ localStorage.setItem(LS_STYLE, state.style); }catch{} }
-function saveStyles(){ try{ localStorage.setItem(LS_STYLES, JSON.stringify(state.styles||[])); }catch{} }
+function saveStyle(){ schedulePrefsPush(); }   // 当前风格选择随 prefs 走,不再写 localStorage
+function saveStyles(){ try{ localStorage.setItem(LS_STYLES, JSON.stringify(state.styles||[])); }catch{} schedulePrefsPush(); }
 /* ---------------- 风格预设(提示词工具页可编辑;选择器在「全局|世界传说」旁) ----------------
  * 选风格 = 套用该预设的 system 提示词 + 采样参数;选「自定义」不覆盖(保持模型预设/手调)。
  * 风格词由 effectiveSysPrompt 读取(不写入 state.sysPrompt,保持手调值干净)。
  */
 function applyStyle(id, persist){
-  const preset = (state.styles||[]).find(p=>p.id===id) || null;
+  // 20260916 偏移层:风格只决定"偏移量",不再改写基准参数(根治"风格污染模型配置")
   state.style = id;
   if(persist) saveStyle();
-  if(id !== "custom" && preset && preset.params){
-    state.params = { ...state.params, ...preset.params };
-  } else if(id === "custom"){
-    // 「自定义(不套用)」= 真正关闭风格：清掉之前风格套用的参数残留。
-    // 恢复顺序：当前模型绑定配置优先 → 否则默认参数(max_tokens 保持)。
-    const mc = getModelCfg(state.model);
-    if(mc.params){
-      state.params = { ...mc.params };
-    } else {
-      state.params = { ...DEFAULT_PARAMS, max_tokens: state.params.max_tokens };
-    }
-  }
   syncParamUI();
   const sp = el("sysPrompt"); if(sp) sp.value = effectiveSysPrompt();
 }
 function populateStyleSel(){
   const sel = el("styleSel"); if(!sel) return;
   sel.innerHTML = "";
-  (state.styles||[]).forEach(p=>{
+  // 「自定义(不套用)」为虚拟项(不在服务端列表中,需求:保持当前 system 词与参数不变)
+  const co = document.createElement("option");
+  co.value = CUSTOM_STYLE.id; co.textContent = CUSTOM_STYLE.name; co.title = CUSTOM_STYLE.desc || "";
+  if(CUSTOM_STYLE.id === state.style) co.selected = true;
+  sel.appendChild(co);
+  (state.styles||[]).forEach(p=>{ if(!p || p.id === CUSTOM_STYLE.id) return;
     const o = document.createElement("option");
     o.value = p.id; o.textContent = p.name;
     if(p.desc) o.title = p.desc;
+    if(p.id === state.style) o.selected = true;
+    sel.appendChild(o);
+  });
+  // 浏览器版本风格也列出来(可直接使用;未提交服务端)
+  ((state.browserPrefs&&state.browserPrefs.styles)||[]).forEach(p=>{ if(!p || p.id === CUSTOM_STYLE.id) return;
+    const o = document.createElement("option");
+    o.value = p.id; o.textContent = (p.name||p.id) + "(浏览器版本)";
+    o.title = "浏览器本地残留,未提交服务端";
     if(p.id === state.style) o.selected = true;
     sel.appendChild(o);
   });
@@ -292,54 +342,233 @@ function onStyleChange(){
   const id = el("styleSel").value;
   applyStyle(id, true);
 }
-function saveCfg(){ localStorage.setItem(LS_CONFIG, JSON.stringify(state.cfg)); }
-function saveModelCfg(){ localStorage.setItem(LS_MODELCFG, JSON.stringify(state.modelCfg)); }
+function saveCfg(){ localStorage.setItem(LS_CONFIG, JSON.stringify(state.cfg)); schedulePrefsPush(); }
+function saveModelCfg(){ localStorage.setItem(LS_MODELCFG, JSON.stringify(state.modelCfg)); schedulePrefsPush(); }
 function saveThinkBlacklist(){ try{ localStorage.setItem(LS_THINK_BL, JSON.stringify([...state.thinkBlacklist])); }catch{} }
 
-/* ---------------- 服务端存储(跨设备接力) ----------------
- * 服务目录下的 projects_store.json 作为跨设备共享存档。
- * pushToServer:本地 -> 服务端(last-write-wins,带 updatedAt)。
- * pullFromServer:服务端 -> 本地覆盖(用于换设备/浏览器接力)。
+/* ---------------- 用户预设:服务端为唯一权威(任务书需求 1/2/3/4/5) ----------------
+ * 权威源 = 服务端 prefs.json。localStorage 只作为「浏览器版本预设」(当前 origin 的残留):
+ *   仅用于 展示 / 单条提交到服务器 / 一键清空,**绝不自动上推覆盖服务端,也绝不作为启动默认值**。
+ * 历史教训:localStorage 按 origin(协议+主机+端口) 隔离,换 IP/换端口就是一份全新空存储,
+ *          旧数据读不到 → 表现为"预设被重置且难以找回";所以权威数据必须放服务端。
+ * 安全:cfg 只上传白名单字段,**在线密钥永不出本机,服务端也不持有**。
  */
-function serverUrl(){ return location.origin + "/api/projects"; }
-function currentSnapshot(){ return { updatedAt: Date.now(), data: { projects: state.projects, pool: state.pools } }; }
+const PREF_CFG_KEYS = ["backend","ollamaUrl","onlineBase","tailChars","maxTokens","think","autoSummary","scanEnabled","fontScale"];
+const SYS_KEY = "xietai.sysglobal.v1";      // 浏览器本地系统提示词(仅作"浏览器版本"登记)
+function prefsSnapshot(){
+  const cfg = {};
+  PREF_CFG_KEYS.forEach(k=>{ if(state.cfg && state.cfg[k] !== undefined) cfg[k] = state.cfg[k]; });
+  return {
+    sysPrompt: state.sysPrompt || "",
+    styles: (state.styles || []).filter(x=> x && x.id && x.id !== CUSTOM_STYLE.id),
+    style: state.style || "custom",
+    modelCfg: state.modelCfg || {},
+    params: state.params || {},
+    promptItems: state.promptItems || [],
+    mode: state.mode || "chat",
+    cfg: cfg
+  };
+}
+async function _prefsJson(r){ try{ return await r.json(); }catch(e){ return null; } }
+var _prefPushT = null;
+/* 去抖推送:只在"用户显式修改预设"的保存漏斗里调用(saveSysSettings/saveStyles/saveCfg/...),
+   init 期间的写入被 initDone 拦掉 → 满足"禁止本地残留自动上推" */
+function schedulePrefsPush(){
+  if(!state.initDone) return;
+  clearTimeout(_prefPushT);
+  _prefPushT = setTimeout(()=>{ pushPrefs(true); }, 1200);
+}
+/* 全量推送(带 updatedAt 乐观并发校验:服务端已被别处改动则 409,不覆盖) */
+async function pushPrefs(silent){
+  try{
+    const body = prefsSnapshot();
+    body.expectedUpdatedAt = state._prefsUpdatedAt || 0;
+    const r = await fetchWithTimeout(location.origin + "/api/prefs", {
+      method:"PUT", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)
+    }, 10000);
+    if(r.status === 409){
+      const j = await _prefsJson(r);
+      if(j && j.serverUpdatedAt) state._prefsUpdatedAt = j.serverUpdatedAt;
+      v2Toast("服务端预设已被其他窗口更新,本次未保存(已重新同步,请再试一次)", "err");
+      if(j && j.prefs){ applyPrefs(j.prefs); renderStyleList(); renderPromptItems(); renderSysBrowser(); syncParamUI(); }
+      return false;
+    }
+    if(!r.ok){ if(!silent) v2Toast("预设同步失败:"+r.status, "err"); return false; }
+    const j = await _prefsJson(r);
+    if(j && j.updatedAt) state._prefsUpdatedAt = j.updatedAt;
+    return true;
+  }catch(e){ if(!silent) v2Toast("预设同步失败:"+describeErr(e, "/api/prefs"), "err"); return false; }
+}
+/* 采用服务端数据(不写 localStorage、不触发推送) */
+function applyPrefs(p){
+  if(!p || typeof p !== "object") return false;
+  if(typeof p.sysPrompt === "string") state.sysPrompt = p.sysPrompt;
+  // 服务端列表不应包含「自定义（不套用）」虚拟项（旧版误推送过）→ 过滤 + 按 id 去重
+  state.styles = Array.isArray(p.styles) ? dedupeById(p.styles.filter(x=> x && x.id && x.id !== CUSTOM_STYLE.id)) : [];
+  state.promptItems = Array.isArray(p.promptItems) ? dedupeById(p.promptItems.filter(x=> x && x.id)) : [];
+  state.style = p.style || "custom";
+  if(p.modelCfg && typeof p.modelCfg === "object") state.modelCfg = p.modelCfg;
+  if(p.params && typeof p.params === "object" && Object.keys(p.params).length) state.params = stripMaxTokens({ ...state.params, ...p.params });
+  if(p.mode) state.mode = p.mode;
+  if(p.cfg && typeof p.cfg === "object") state.cfg = { ...state.cfg, ...p.cfg };   // 白名单字段,不含密钥
+  if(p.updatedAt) state._prefsUpdatedAt = p.updatedAt;
+  return true;
+}
+/* 启动:只以服务端为准;服务端为空就保持为空(不回退内置/本地) */
+async function loadPrefsFromServer(){
+  try{
+    const r = await fetchWithTimeout(location.origin + "/api/prefs", { cache:"no-store" }, 10000);
+    if(!r.ok) return false;
+    const p = await _prefsJson(r);
+    if(!p || !p.updatedAt) return false;     // 服务端尚无预设 → 保持空
+    applyPrefs(p);
+    applyFontScale(state.cfg.fontScale || 1);
+    return true;
+  }catch(e){ return false; }
+}
+/* ---------------- 浏览器版本预设(当前 origin 的 localStorage 残留) ---------------- */
+function detectBrowserPrefs(){
+  const bp = { sysPrompt:"", styles:[], promptItems:[] };
+  try{
+    const s = loadJSON(SYS_KEY, null);
+    const ls = (s && typeof s.sysPrompt === "string") ? s.sysPrompt.trim() : "";
+    if(ls && ls !== (state.sysPrompt || "").trim()) bp.sysPrompt = ls;   // 与服务端不一致才算"浏览器版本"
+    // 按"内容签名"比对：与服务端不同（含同 id 内容不同）才算浏览器版本；完全一致则忽略，避免重复展示
+    const srvStyles = new Map((state.styles||[]).map(x=>[x.id, styleSig(x)]));
+    const seenS = new Set();
+    (loadJSON(LS_STYLES, []) || []).forEach(x=>{
+      if(!x || !x.id || x.id === CUSTOM_STYLE.id || seenS.has(x.id)) return;
+      if(srvStyles.get(x.id) !== styleSig(x)){ seenS.add(x.id); bp.styles.push(x); }
+    });
+    const srvItems = new Map((state.promptItems||[]).map(x=>[x.id, piSig(x)]));
+    const seenI = new Set();
+    (loadJSON(LS_PROMPTITEMS, []) || []).forEach(x=>{
+      if(!x || !x.id || seenI.has(x.id)) return;
+      if(srvItems.get(x.id) !== piSig(x)){ seenI.add(x.id); bp.promptItems.push(x); }
+    });
+  }catch(e){}
+  state.browserPrefs = bp;
+  return hasBrowserPrefs();
+}
+function hasBrowserPrefs(){
+  const b = state.browserPrefs || {};
+  return !!(b.sysPrompt || (b.styles||[]).length || (b.promptItems||[]).length);
+}
+function updatePrefsToolbar(){
+  const btn = el("prefClearLocal"); if(!btn) return;
+  btn.style.display = hasBrowserPrefs() ? "" : "none";
+}
+/* 需求3:一键清空浏览器本地预设(二次确认;只动 localStorage,不动服务端) */
+function clearBrowserPrefs(){
+  if(!hasBrowserPrefs()){ v2Toast("当前地址没有浏览器本地预设", "ok"); return; }
+  if(!confirm("清空浏览器本地预设?\n\n只清除本浏览器地址下的残留(风格/系统提示词/提示词条目),\n不影响服务端 prefs.json。")) return;
+  try{
+    localStorage.removeItem(LS_STYLES);
+    localStorage.removeItem(SYS_KEY);
+    localStorage.removeItem(LS_PROMPTITEMS);
+  }catch(e){}
+  detectBrowserPrefs();
+  renderStyleList(); renderPromptItems(); renderSysBrowser(); updatePrefsToolbar(); populateStyleSel();
+  v2Toast("已清空浏览器本地预设(服务端未改动)", "ok");
+}
+/* 需求4:单条提交到服务器(仅支持单条,显式确认) */
+async function submitBrowserItem(field, id){
+  const bp = state.browserPrefs || {};
+  let payload = null, label = id;
+  if(field === "sysPrompt"){
+    if(!bp.sysPrompt) return;
+    payload = { field:"sysPrompt", value: bp.sysPrompt }; label = "系统提示词";
+  } else {
+    const item = (bp[field]||[]).find(x=>x.id===id); if(!item) return;
+    label = item.name || id;
+    payload = { field: field, item: item };
+  }
+  if(!confirm("提交到服务器?\n\n"+label+"\n\n会写入服务端 prefs.json(唯一权威源),并从浏览器版本中移除该条。")) return;
+  try{
+    const r = await fetchWithTimeout(location.origin + "/api/prefs/item", {
+      method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(payload)
+    }, 10000);
+    if(!r.ok){ v2Toast("提交失败:"+r.status, "err"); return; }
+    const p = await _prefsJson(r);
+    if(p) applyPrefs(p);
+    // 服务端已生效 → 从浏览器本地残留里移除该条
+    try{
+      if(field === "sysPrompt"){ localStorage.removeItem(SYS_KEY); }
+      else {
+        const key = (field === "styles") ? LS_STYLES : LS_PROMPTITEMS;
+        const cur = loadJSON(key, []) || [];
+        localStorage.setItem(key, JSON.stringify((Array.isArray(cur)?cur:[]).filter(x=> !x || x.id !== id)));
+      }
+    }catch(e){}
+    detectBrowserPrefs();
+    renderStyleList(); renderPromptItems(); renderSysBrowser(); updatePrefsToolbar(); populateStyleSel(); syncParamUI();
+    v2Toast("已提交到服务器:"+label, "ok");
+  }catch(e){ v2Toast("提交失败:"+describeErr(e, "/api/prefs/item"), "err"); }
+}
+/* 按 id 去重（保留先出现的） */
+function dedupeById(arr){
+  const seen = new Set(); const out = [];
+  (arr||[]).forEach(x=>{ if(x && x.id && !seen.has(x.id)){ seen.add(x.id); out.push(x); } });
+  return out;
+}
+/* 内容签名：用于判断"本地残留与服务端是否真的不同"（避免同 id 同内容被重复展示） */
+function styleSig(x){
+  const ps = (x && x.params) || {};
+  return JSON.stringify([(x&&x.name)||"", (x&&x.desc)||"", (x&&x.sysPrompt)||"",
+                         Object.keys(ps).sort().map(k=>[k, ps[k]])]);
+}
+function piSig(x){
+  return JSON.stringify([(x&&x.name)||"", (x&&x.content)||"", (x&&x.role)||"",
+                         (x&&x.position)||"", Number((x&&x.depth)||0), (x&&x.enabled)!==false]);
+}
+/* 风格查找：服务端优先，其次浏览器版本（需求2：浏览器版本也能直接使用） */
+function findStyleById(id){
+  return (state.styles||[]).find(p=>p.id===id)
+      || ((state.browserPrefs&&state.browserPrefs.styles)||[]).find(p=>p.id===id)
+      || null;
+}
+/* 需求2:系统提示词区 —— 两行文本对照(简洁版) */
+function renderSysBrowser(){
+  const box = el("sysBrowserBox"); if(!box) return;
+  const bp = state.browserPrefs || {};
+  const srv = state.sysPrompt || "";
+  const loc = bp.sysPrompt || "";
+  const nl2br = v => esc(v).replace(/\n/g, "<br>");
+  box.style.display = "block";
+  if(loc){
+    box.innerHTML = `
+      <div class="sys-line">
+        <span class="sys-lab local">本地：</span>
+        <span class="sys-txt">${nl2br(loc)}</span>
+        <span class="sys-ops">
+          <button class="mini-btn primary" id="bpSysSubmit">提交</button>
+          <button class="mini-btn danger" id="bpSysClear">清除</button>
+        </span>
+      </div>
+      <div class="sys-line"><span class="sys-lab">服务器：</span><span class="sys-txt">${srv ? nl2br(srv) : '<i class="sys-empty">（空）</i>'}</span></div>`;
+    const sub = el("bpSysSubmit"); if(sub) sub.onclick = ()=> submitBrowserItem("sysPrompt", "");
+    const clr = el("bpSysClear"); if(clr) clr.onclick = ()=>{
+      if(!confirm("清除浏览器本地系统提示词？（不影响服务端）")) return;
+      try{ localStorage.removeItem(SYS_KEY); }catch(e){}
+      detectBrowserPrefs(); renderSysBrowser(); renderStyleList(); renderPromptItems(); updatePrefsToolbar();
+      v2Toast("已清除本地系统提示词", "ok");
+    };
+  } else {
+    // 无本地版本 → 只显示服务器值(不带“服务器”标记)
+    box.innerHTML = `<div class="sys-line"><span class="sys-txt">${srv ? nl2br(srv) : '<i class="sys-empty">（服务端尚未设置系统提示词）</i>'}</span></div>`;
+  }
+}
+
+/* 20260916 删除:V1 项目快照同步(serverUrl / currentSnapshot / pushToServer / pullFromServer)
+ * 原因:serve.py 从无 /api/projects 路由 —— 每次编辑都静默 404 并在顶栏闪「同步失败 404」;
+ * V2 已用 universes / works / worldbooks 分实体持久化,不需要整快照。
+ * 另:设定包(packs)同步的 URL 拼错(serverUrl()+… 变成 /api/projects/api/lorebooks)已修正,
+ * 并新增服务端 /api/lorebooks 落盘。 */
 function setSyncStatus(text, cls){
   const s = el("syncStatus");
   if(!s) return;
   s.textContent = text || "";
   s.className = "sync-status" + (cls ? " "+cls : "");
-}
-async function pushToServer(silent){
-  try{
-    setSyncStatus("同步中…", "busy");
-    const r = await fetchWithTimeout(serverUrl(),
-      { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(currentSnapshot()) }, 10000);
-    if(r.status === 409){
-      if(!silent) alert("未覆盖:" + (j.error||"服务端已有更新存档"));
-      setSyncStatus("冲突未覆盖", "err"); setTimeout(()=>setSyncStatus(""), 2500);
-      return false;
-    }
-    if(!r.ok){ setSyncStatus("同步失败 "+r.status, "err"); setTimeout(()=>setSyncStatus(""), 3000); if(!silent) alert("同步失败:"+r.status); return false; }
-    const j = await r.json().catch(()=>({}));
-    setSyncStatus("已同步 ✓", "ok"); setTimeout(()=>setSyncStatus(""), 2000);
-    return true;
-  }catch(e){ setSyncStatus("同步失败", "err"); setTimeout(()=>setSyncStatus(""), 3000); if(!silent) alert("同步失败:"+describeErr(e, serverUrl())); return false; }
-}
-async function pullFromServer(){
-  try{
-    const r = await fetchWithTimeout(serverUrl(), { cache:"no-store" }, 10000);
-    if(!r.ok){ alert("拉取失败:" + r.status); return; }
-    const j = await r.json();
-    const data = j.data || {};
-    if(!data.projects || !data.projects.length){ alert("服务端暂无存档"); return; }
-    if(!confirm("将从服务端拉取存档并覆盖本地(当前本地改动会丢失)。确定?")) return;
-    state.projects = data.projects;
-    if(data.pool) state.pools = data.pool;
-    state.curPid = state.projects[0].id;
-    saveProjects(); savePool();
-    renderAll();
-    alert("已拉取服务端存档(" + new Date(j.updatedAt||Date.now()).toLocaleString() + ")");
-  }catch(e){ alert("拉取失败:" + describeErr(e, serverUrl())); }
 }
 function bindSyncBtn(){
   if(el("syncBtn")) el("syncBtn").onclick = async ()=>{
@@ -347,7 +576,7 @@ function bindSyncBtn(){
       await loadGlobal(); await loadWorldBooks(); await loadUniverses(); await loadWorks();
       renderWorldBrowser(); renderV2UniverseBar(); renderV2WorkBar();
       if(typeof renderV2GlobalSheet === "function") renderV2GlobalSheet();
-      v2Toast("已刷新：世界书库 / 全局激活 / 宇宙 / 作品", "ok");
+      v2Toast("已刷新:世界书库 / 全局激活 / 宇宙 / 作品", "ok");
     }catch(e){ v2Toast("刷新失败", "err"); }
   };
 }
@@ -371,13 +600,14 @@ function bindPackUI(){
 }
 // 取某模型专属配置;不存在返回空对象
 function getModelCfg(name){ return (name && state.modelCfg[name]) ? state.modelCfg[name] : {}; }
-// 「系统提示词」层:全局手调 > 默认(不再随模型切换重置;风格词独立由 systemPromptParts() 第二段注入)。
+// 「系统提示词」层:仅取服务端值(需求5:为空就是为空,不回退任何内置默认值;也不读 localStorage)。
 function effectiveSysPrompt(){
-  return state.sysPrompt || DEFAULT_SYSPROMPT;
+  return state.sysPrompt || "";
 }
-/* 系统提示词(全局)持久化——只存系统词,模板随模型(原样) */
+/* 系统提示词(全局)持久化--只存系统词,模板随模型(原样) */
 function saveSysSettings(){
   try{ localStorage.setItem("xietai.sysglobal.v1", JSON.stringify({ sysPrompt: state.sysPrompt })); }catch(e){}
+  schedulePrefsPush();
 }
 /* 分层组装系统区(对齐 ST story_string 的独立字段拼接):
  *  [before 条目] [系统提示词] [风格预设词] [常驻设定] [in 条目]
@@ -392,7 +622,7 @@ function systemPromptParts(){
   }
   const sys = effectiveSysPrompt();
   if(sys && sys.trim()) parts.push(sys.trim());
-  const sp = (state.styles||[]).find(p=>p.id===state.style);
+  const sp = findStyleById(state.style);
   if(state.style !== "custom" && sp && sp.sysPrompt && sp.sysPrompt.trim()) parts.push(sp.sysPrompt.trim());
   for(const it of (state.promptItems||[])){
     if(!it.enabled || it.position !== "in") continue;
@@ -401,7 +631,7 @@ function systemPromptParts(){
   return parts;
 }
 /* 前文窗口内的 in_chat 条目(按 depth 从窗口尾部插入,0=紧贴断点前)
- * extras: 世界书 position=4 的条目 [{content, depth}]，与提示词条目同机制注入 */
+ * extras: 世界书 position=4 的条目 [{content, depth}],与提示词条目同机制注入 */
 function chatPromptItems(text, extras){
   const items = (state.promptItems||[]).filter(it=>it.enabled && it.position === "in_chat" && it.content && it.content.trim())
     .map(it=>({ content: it.content.trim(), depth: Number(it.depth)||0 }));
@@ -426,7 +656,7 @@ function newProject(name){
   return { id: "p"+Date.now()+Math.floor(Math.random()*1000), name, text:"", summary:null, ts:Date.now() };
 }
 function curProject(){
-  // 新语义：当前章节即"文档"。提供旧接口 {id,name,text,summary} 供 buildPrompt/摘要等复用。
+  // 新语义:当前章节即"文档"。提供旧接口 {id,name,text,summary} 供 buildPrompt/摘要等复用。
   const ch = V2.curChapter;
   if(ch) return { id: ch.id, name: ch.title || "未命名", text: ch.body || "", summary: ch.summary || null };
   return null;
@@ -525,10 +755,10 @@ function matchPreset(name){
 }
 function applyParams(p){
   for(const k of PARAM_KEYS){ if(p[k] !== undefined) state.params[k] = p[k]; }
-  if(p.max_tokens) state.params.max_tokens = p.max_tokens;
+  stripMaxTokens(p); stripMaxTokens(state.params);   // 长度不再随模型/预设走(统一由系统设置控制)
   saveParams(); syncParamUI();
 }
-function saveParams(){ localStorage.setItem(LS_PARAMS, JSON.stringify(state.params)); }
+function saveParams(){ localStorage.setItem(LS_PARAMS, JSON.stringify(state.params)); schedulePrefsPush(); }
 /* 调参即存:滑块调整后防抖写入当前模型预设(切换模型即切换预设) */
 let _paramSaveT = null;
 function autoSaveModelParams(){
@@ -556,11 +786,8 @@ function onModelSwitch(name, force){
   else { const m = matchPreset(name); if(m && !m.skip){ params = m.params; plabel = "内置预设"; } }
   if(params){ applyParams(params); hint.push("参数("+plabel+")"); }
   el("presetHint").textContent = hint.length ? ("已套用:" + hint.join("+")) : "未匹配,使用当前值";
-  // 风格预设优先于模型配置:若选了具体风格(非自定义),重新套用其 params(风格词由 effectiveSysPrompt 读取)
-  if(state.style && state.style !== "custom"){
-    const sp = (state.styles||[]).find(p=>p.id===state.style);
-    if(sp && sp.params) applyParams({ ...state.params, ...sp.params });
-  }
+  // 20260916 偏移层:风格不再回写 state.params(基准),而是在生成时以"基准 + 有限偏移"叠加;
+  // 因此这里无需再套用风格参数(风格词仍由 effectiveSysPrompt / systemPromptParts 注入)。
 }
 
 /* ---------------- 思考块分离(DS R1 系 / 部分模型 inline <think>) ----------------
@@ -592,9 +819,9 @@ function splitThink(text){
 
 /* ---------------- Ollama 流式 ---------------- */
 async function* streamChat(model, messages, { think=false, params={}, onThink } = {}){
-  // 在线模式：OpenAI 兼容 Chat Completions（思考块在 delta.reasoning_content）
+  // 在线模式:OpenAI 兼容 Chat Completions(思考块在 delta.reasoning_content)
   if(state.cfg.backend === "online") return yield* streamChatOnline(model, messages, { params, onThink });
-  const opt = { num_predict: Number(params.max_tokens || state.cfg.maxTokens || CONFIG.defaultMaxTokens) };
+  const opt = { num_predict: Number(state.cfg.maxTokens || CONFIG.defaultMaxTokens) };   // 长度统一走系统设置
   for(const k of PARAM_KEYS){ if(params[k] !== undefined && params[k] !== null && params[k] !== "") opt[k] = Number(params[k]); }
 
   // 不支持 thinking 的模型(首请求 400 后由 state.thinkBlacklist 记录)发 think:false
@@ -652,11 +879,11 @@ function genOptions(params){
   const o = {};
   const map = { temperature:"temperature", top_p:"top_p", top_k:"top_k", repeat_penalty:"repeat_penalty", min_p:"min_p" };
   for(const k in map){ if(params[k] !== undefined && params[k] !== null && params[k] !== "") o[map[k]] = Number(params[k]); }
-  o.num_predict = Number(params.max_tokens || state.cfg.maxTokens || CONFIG.defaultMaxTokens);
+  o.num_predict = Number(state.cfg.maxTokens || CONFIG.defaultMaxTokens);   // 长度统一走系统设置
   return o;
 }
 async function* streamGenerate(model, prompt, { raw=true, params={} } = {}){
-  // 在线模式：OpenAI 兼容 Text Completions（纯文本流,思考块以文本形式原样返回）
+  // 在线模式:OpenAI 兼容 Text Completions(纯文本流,思考块以文本形式原样返回)
   if(state.cfg.backend === "online") return yield* streamGenerateOnline(model, prompt, { params });
   const body = { model, prompt, stream:true, raw, options: genOptions(params) };
   if(state.cfg && state.cfg.think === false) body.think = false;   // 本地补全通道也关思考(Qwen3/QwQ 等默认开)
@@ -683,10 +910,10 @@ async function* streamGenerate(model, prompt, { raw=true, params={} } = {}){
     }
   }
 }
-/* 在线模式 Chat Completions 流式：delta.content=正文 / delta.reasoning_content=思考 */
-/* 在线通道关闭思考的适配参数：
+/* 在线模式 Chat Completions 流式:delta.content=正文 / delta.reasoning_content=思考 */
+/* 在线通道关闭思考的适配参数:
  * DS R1 / V3.1 系(think:false) 与 Qwen 系(enable_thinking:false, DashScope/硅基流动等 OpenAI 兼容)
- * 是各自独立研发的机制,参数互不通用 —— 按模型名路由,避免发错参数被 400。
+ * 是各自独立研发的机制,参数互不通用 -- 按模型名路由,避免发错参数被 400。
  * cfg.think 非 false 时返回 null(不干预)。 */
 function onlineThinkOpt(){
   if(!(state.cfg && state.cfg.think === false)) return null;
@@ -704,8 +931,7 @@ async function retryWithoutThinkOpt(res, url, body){
   return apiFetch(url, { method:"POST", headers: apiHeaders(), body: JSON.stringify(body) });
 }
 async function* streamChatOnline(model, messages, { params={}, onThink } = {}){
-  const opt = {};
-  if(params.max_tokens) opt.max_tokens = Number(params.max_tokens);
+  const opt = { max_tokens: requestMaxTokens() };   // 长度统一走系统设置
   for(const k of PARAM_KEYS){ if(params[k] !== undefined && params[k] !== null && params[k] !== "") opt[k] = Number(params[k]); }
   const body = { model, messages, stream:true, ...opt, ...(onlineThinkOpt()||{}) };   // 按模型适配 think/enable_thinking
   let res = await apiFetch(apiBase() + "/chat/completions", {
@@ -735,10 +961,9 @@ async function* streamChatOnline(model, messages, { params={}, onThink } = {}){
     }
   }
 }
-/* 在线模式 Text Completions 流式：choices[0].text 纯文本（补全模式用） */
+/* 在线模式 Text Completions 流式:choices[0].text 纯文本(补全模式用) */
 async function* streamGenerateOnline(model, prompt, { params={} } = {}){
-  const opt = {};
-  if(params.max_tokens) opt.max_tokens = Number(params.max_tokens);
+  const opt = { max_tokens: requestMaxTokens() };   // 长度统一走系统设置
   for(const k of PARAM_KEYS){ if(params[k] !== undefined && params[k] !== null && params[k] !== "") opt[k] = Number(params[k]); }
   const body = { model, prompt, stream:true, ...opt, ...(onlineThinkOpt()||{}) };   // 在线补全通道同样按模型适配
   let res = await apiFetch(apiBase() + "/completions", {
@@ -768,7 +993,7 @@ async function* streamGenerateOnline(model, prompt, { params={} } = {}){
 }
 async function* genWithFallback(model, prompt, params){
   // raw:true 优先(纯补全);仅在"请求阶段就失败(一个字节都没产出)"时回退 raw:false 重发。
-  // 流式中途断连(远程隧道抖动常见):保留已生成内容直接报错停止,绝不从头重跑——
+  // 流式中途断连(远程隧道抖动常见):保留已生成内容直接报错停止,绝不从头重跑--
   // 否则用户会看到"一次生成自动跑多轮、内容从头重复"。
   let produced = false;
   try{
@@ -804,35 +1029,36 @@ function updatePendingThink(acc){
  *    走 /api/chat 的 continue-last-message 范式(SillyTavern Continue 同思路):模型视前文为己出,
  *    自然衔接、无伪问答边界;且复用与深度续写相同的结构化思考字段(reasoning_content/thinking)。
  */
-/* 系统区精确分层（位置 0-6 各自生效,三模式共用）:
+/* 系统区精确分层(位置 0-6 各自生效,三模式共用):
  * [pos0 开头] [before条目+系统词+风格词] [pos1 设定区] [常驻设定] [pos2作者注前 + pos3作者注后] [in条目]
  */
 function buildSystemParts(matched, always){
   const sysParts = [];
-  const m0 = matched.filter(m => m.pos === 0);
-  if(m0.length) sysParts.push("【设定·开头】\n" + m0.map(p=>`# ${p.title}\n${p.body}`).join("\n\n"));
+  const m0 = matched.filter(m => m.pos === 0).sort((a,b)=>Number(a.order??100)-Number(b.order??100));
+  if(m0.length) sysParts.push("【设定·开头】\n" + m0.map(p=>`${p.body}`).join("\n\n"));
   sysParts.push(...systemPromptParts());
-  const m1 = matched.filter(m => m.pos === 1);
-  if(m1.length) sysParts.push("【设定区】\n" + m1.map(p=>`# ${p.title}\n${p.body}`).join("\n\n"));
+  const m1 = matched.filter(m => m.pos === 1).sort((a,b)=>Number(a.order??100)-Number(b.order??100));
+  if(m1.length) sysParts.push("【设定区】\n" + m1.map(p=>`${p.body}`).join("\n\n"));
   if(always.length){
-    sysParts.push("【常驻设定】\n" + always.map(p=>`# ${p.title}\n${p.body}`).join("\n\n"));
+    const aSorted = always.slice().sort((a,b)=>Number(a.order??100)-Number(b.order??100));
+    sysParts.push("【常驻设定】\n" + aSorted.map(p=>`${p.body}`).join("\n\n"));
   }
-  const m23 = matched.filter(m => m.pos === 2 || m.pos === 3);   // 作者注:2前3后
-  if(m23.length) sysParts.push("【作者注】\n" + m23.map(p=>`# ${p.title}\n${p.body}`).join("\n\n"));
+  const m23 = matched.filter(m => m.pos === 2 || m.pos === 3).sort((a,b)=>Number(a.order??100)-Number(b.order??100));   // 作者注:2前3后
+  if(m23.length) sysParts.push("【作者注】\n" + m23.map(p=>`${p.body}`).join("\n\n"));
   // 自动关闭长思考:cfg.think=false 时向 system 注入输出约束段落(覆盖 chat/complete/completion 三模式;
   // 对 /api/generate 与在线后端等无 think 参数通道的场景,这是唯一/兜底手段)
   if(state.cfg && state.cfg.think === false){
-    sysParts.push("【输出约束】直接输出小说正文。不要输出任何思考、推理或分析过程，不要使用<think>标签。");
+    sysParts.push("【输出约束】直接输出小说正文。不要输出任何思考、推理或分析过程,不要使用<think>标签。");
   }
   return sysParts;
 }
 async function buildPrompt(project, instruction){
-  // Phase 2b: 若已选世界+作品集，优先用 v2 激活引擎
+  // Phase 2b: 若已选世界+作品集,优先用 v2 激活引擎
   const v2 = v2EntriesIfActive(project.text || "");
   let entries, always, matched;
   if(v2){
     entries = v2.entries; always = v2.always;
-    // 可选条目：由 v2EntriesIfActive 按「四态逻辑 + 三模式 + 扫描开关」算好（对齐 ST）
+    // 可选条目:由 v2EntriesIfActive 按「四态逻辑 + 三模式 + 扫描开关」算好(对齐 ST)
     matched = v2.matched || [];
   } else {
     entries = activeEntries();
@@ -843,8 +1069,8 @@ async function buildPrompt(project, instruction){
       pos: (m.position !== undefined && m.position !== null) ? Number(m.position) : 5
     }));
   }
-  // —— 安全闸门 SafeGate：在线模式下 ⚠️标记条目等同关闭（优先于常驻/逻辑/向量模式），安全条目放行 ——
-  //     （已标记词条已在 computeActiveEntries 源头排除；此处对未标记条目自动检查并持久化新标记）
+  // -- 安全闸门 SafeGate:在线模式下 ⚠️标记条目等同关闭(优先于常驻/逻辑/向量模式),安全条目放行 --
+  //     (已标记词条已在 computeActiveEntries 源头排除;此处对未标记条目自动检查并持久化新标记)
   let blocked = [];
   if(SG_ACTIVE() && (always.length || matched.length)){
     const items = [];
@@ -872,9 +1098,9 @@ async function buildPrompt(project, instruction){
       ? ("请从上面最后一句的自然断点接着往下写,保持同一个人称与文风,直接输出新增的叙事正文,不要解释、不要分析、不要复述前文。走向提示:" + instruction.trim())
       : "请从上面最后一句的自然断点接着往下写,保持同一个人称与文风,直接输出新增的叙事正文,不要解释、不要分析、不要复述前文。";
     // 代笔(continue)模式:位置 4/5/6 的条目并入 system(前文是 assistant 锚点,注入会污染断点)
-    const m456 = matched.filter(m => m.pos >= 4);
+    const m456 = matched.filter(m => m.pos >= 4).sort((a,b)=>Number(a.order??100)-Number(b.order??100));
     if(m456.length){
-      sysParts.push("【参考设定】\n" + m456.map(p=>`# ${p.title}\n${p.body}`).join("\n\n"));
+      sysParts.push("【参考设定】\n" + m456.map(p=>`${p.body}`).join("\n\n"));
     }
     const messages = [
       { role:"system", content: sysParts.join("\n\n---\n\n") },
@@ -889,14 +1115,14 @@ async function buildPrompt(project, instruction){
     // 结构: [系统+常驻+可选匹配设定] [前文(去掉末句)] [(写作方向指令)] [断点]
     // 思考续接:上次生成停在思考块内(<think>未闭合)时,pendingThink 拼回断点,模型继续推理,不重新写
     const parts = buildSystemParts(matched, always);
-    const mInC = matched.filter(m => m.pos === 4).map(m=>({ content: "# " + m.title + "\n" + m.body, depth: m.depth }));
+    const mInC = matched.filter(m => m.pos === 4).sort((a,b)=>Number(a.order??100)-Number(b.order??100)).map(m=>({ content: m.body, depth: m.depth }));
     const window = chatPromptItems(project.text.slice(-(Number(CONFIG.completeTailChars)||1500)), mInC);
     const lastLine = (window.split("\n").filter(Boolean).pop() || "").trimEnd();
     const body = window.slice(0, Math.max(0, window.lastIndexOf(lastLine)));
-    const instr = instruction && instruction.trim() ? "（写作方向：" + instruction.trim() + "）" : "";
+    const instr = instruction && instruction.trim() ? "(写作方向:" + instruction.trim() + ")" : "";
     const tail = state.pendingThink || lastLine;
-    const mPreC = matched.filter(m => m.pos >= 5);
-    const preBlock = mPreC.length ? "【参考设定】\n" + mPreC.map(p=>`# ${p.title}\n${p.body}`).join("\n\n") + "\n\n" : "";
+    const mPreC = matched.filter(m => m.pos >= 5).sort((a,b)=>Number(a.order??100)-Number(b.order??100));
+    const preBlock = mPreC.length ? "【参考设定】\n" + mPreC.map(p=>`${p.body}`).join("\n\n") + "\n\n" : "";
     const prompt = parts.join("\n\n") + "\n\n" + preBlock + "【前文】\n" + body.trimEnd() + (instr ? "\n" + instr : "") + "\n" + tail;
     return { prompt, blocked };
   }
@@ -904,11 +1130,11 @@ async function buildPrompt(project, instruction){
   // -- 深度续写(chat)模式 --
   // 位置 0-3 已在 system 区(设定区);此处:位置5-6进参考设定段、位置4进前文窗口内
   const usrParts = [];
-  const mPre = matched.filter(m => m.pos >= 5);
+  const mPre = matched.filter(m => m.pos >= 5).sort((a,b)=>Number(a.order??100)-Number(b.order??100));
   if(mPre.length){
-    usrParts.push("【本次参考设定(按前文自动匹配)】\n" + mPre.map(p=>`# ${p.title}\n${p.body}`).join("\n\n"));
+    usrParts.push("【本次参考设定(按前文自动匹配)】\n" + mPre.map(p=>`${p.body}`).join("\n\n"));
   }
-  const mIn = matched.filter(m => m.pos === 4).map(m=>({ content: "# " + m.title + "\n" + m.body, depth: m.depth }));
+  const mIn = matched.filter(m => m.pos === 4).sort((a,b)=>Number(a.order??100)-Number(b.order??100)).map(m=>({ content: m.body, depth: m.depth }));
   const window = chatPromptItems(project.text.slice(-tailChars()), mIn);
   usrParts.push("【前文(待续写)】\n" + window);
   usrParts.push(instruction && instruction.trim()
@@ -929,7 +1155,7 @@ async function doGenerate(){
   if(state.generating) return;
   if(!V2.curChapter || !V2.curWork){ alert("请先选择作品集与章节"); return; }
   if(!state.model){ alert("未检测到模型,确认 ollama 已启动"); return; }
-  // 安全闸门：safeAuto=关 → 检测+阻止（正文命中即拦截，防 Ctrl+Enter 绕过）；safeAuto=开 → 发送时自动映射（见下方）
+  // 安全闸门:safeAuto=关 → 检测+阻止(正文命中即拦截,防 Ctrl+Enter 绕过);safeAuto=开 → 发送时自动映射(见下方)
   if(GATE_ACTIVE()){
     hideGateHint();
     if(state.cfg.safeAuto === false){
@@ -937,34 +1163,34 @@ async function doGenerate(){
       const _r = await sgCheckPositions(_body);
       if(_r && _r.hits && _r.hits.length){
         showGateHint(_r.hits);
-        v2Toast("⚠️ 正文含违规特征，已阻止发送。修改正文、切本地模型，或开启自动脱敏", "err");
+        v2Toast("⚠️ 正文含违规特征,已阻止发送。修改正文、切本地模型,或开启自动脱敏", "err");
         return;
       }
     }
   }
   // 每次续写强制扫描一次连接
   const conn = await probeConnection(true);
-  if(!conn){ alert("无法连接 Ollama(" + state.cfg.ollamaUrl + ")，请确认已启动后重试。"); return; }
+  if(!conn){ alert("无法连接 Ollama(" + state.cfg.ollamaUrl + "),请确认已启动后重试。"); return; }
 
   const project = curProject();
-  await refreshVectorMatches(project.text || "");   // 向量条目：正文语义匹配(embedding 不可用则静默不触发)
+  await refreshVectorMatches(project.text || "");   // 向量条目:正文语义匹配(embedding 不可用则静默不触发)
   if(state.mode === "chat") await ensureSummary(project);  // 摘要仅深度续写用到
   const built = await buildPrompt(project, el("instruction").value);
   const isCompletion = state.mode === "completion";
   const messages = built.messages;  // chat/complete 返回 messages 数组;completion 返回 prompt
   if(built.blocked && built.blocked.length){
     const _bn = built.blocked.map(b=>(b.title||"(未命名)") + (b.cats && b.cats.length ? "(" + sgCatText(b.cats) + ")" : "")).join("、");
-    v2Toast("⚠️ 安全闸门 已屏蔽 " + built.blocked.length + " 条违规设定（未进入拼装）：" + _bn.slice(0, 90), "err");
+    v2Toast("⚠️ 安全闸门 已屏蔽 " + built.blocked.length + " 条违规设定(未进入拼装):" + _bn.slice(0, 90), "err");
   }
 
-  // 安全闸门 · 自动脱敏（safeAuto 默认开）：发送前把上下文敏感词映射为安全词。
-  // 正文/历史/设定原文不动；AI 返回原样追加（无还原）= 纯出站单向过滤，非越狱。
+  // 安全闸门 · 自动脱敏(safeAuto 默认开):发送前把上下文敏感词映射为安全词。
+  // 正文/历史/设定原文不动;AI 返回原样追加(无还原)= 纯出站单向过滤,非越狱。
   if(GATE_ACTIVE() && state.cfg.safeAuto !== false){
     if(isCompletion){
       const _r = await sgCheckPositions(built.prompt);
       if(_r && _r.hits && _r.hits.length){
         built.prompt = sanitizeText(built.prompt, _r.hits);
-        v2Toast("已自动脱敏 " + _r.hits.length + " 处，内容已安全", "ok");
+        v2Toast("已自动脱敏 " + _r.hits.length + " 处,内容已安全", "ok");
       }
     } else {
       let _cnt = 0;
@@ -974,7 +1200,7 @@ async function doGenerate(){
           if(_r && _r.hits && _r.hits.length){ _m.content = sanitizeText(_m.content, _r.hits); _cnt += _r.hits.length; }
         }
       }
-      if(_cnt) v2Toast("已自动脱敏 " + _cnt + " 处，内容已安全", "ok");
+      if(_cnt) v2Toast("已自动脱敏 " + _cnt + " 处,内容已安全", "ok");
     }
   }
   // 快照(撤销)
@@ -984,6 +1210,7 @@ async function doGenerate(){
   state.generating = true;
   setGeneratingUI(true);
   el("thinkPanel").classList.add("open");
+  syncPreviewIcon();
   el("thinkText").textContent = "";
   el("draftText").value = "";
   el("draftText").readOnly = true;          // 生成中锁定编辑
@@ -997,14 +1224,14 @@ async function doGenerate(){
   try{
     if(isCompletion){
       // 真补全:调 /api/generate 流式;raw 优先,失败自动回退默认模板(思考块仍在 response 文本里)
-      for await (const piece of genWithFallback(state.model, built.prompt, state.params)){
+      for await (const piece of genWithFallback(state.model, built.prompt, effectiveParams())){
         acc += piece;
         el("draftText").value = normalizeBlankLines(acc);  // 流式实时清理连续换行
         scrollEnd(el("draftText"));
       }
     } else {
       for await (const piece of streamChat(state.model, messages, {
-        think: useThink, params: state.params, onThink })){
+        think: useThink, params: effectiveParams(), onThink })){
         acc += piece;
         el("draftText").value = normalizeBlankLines(acc);  // 流式实时清理连续换行
         scrollEnd(el("draftText"));
@@ -1081,27 +1308,86 @@ function setDraftActions(on){
   el("acceptBtn").disabled = !on;
   el("discardBtn").disabled = !on;
 }
+/* ---------------- 正文视图/光标辅助(20260916 修「点修改后跳回文章顶部」) ----------------
+ * 机制:renderEditor 用 ta.value=… 整体替换正文时,未聚焦的 textarea 选区会被置于 0;
+ *       紧接着 mobEdit 的 focus() 会把「光标(0)」滚进视口 → scrollTop 被浏览器拉回 0 = 文章顶部。
+ * 对策:focus 之前先把光标放到末尾;focus 之后再断言几次滚动位置(布局重建/收起预览动画/输入法弹起都会改高度),
+ *       并兼容「滚动容器是 textarea」与「滚动容器是页面」两种情形。
+ */
+function setCaretEnd(ta){
+  if(!ta) return;
+  try{
+    const n = (ta.value || "").length;
+    if(typeof ta.setSelectionRange === "function") ta.setSelectionRange(n, n);
+    else { ta.selectionStart = n; ta.selectionEnd = n; }
+  }catch(e){}
+}
+function scrollBottomOf(node){
+  if(!node) return;
+  if(node.scrollHeight > node.clientHeight + 2){ node.scrollTop = node.scrollHeight; return; }
+  const se = document.scrollingElement || document.documentElement;
+  if(se && se.scrollHeight > se.clientHeight + 2) se.scrollTop = se.scrollHeight;
+}
+function pinEditorBottom(ta){
+  const fix = ()=> scrollBottomOf(ta);
+  fix();
+  if(typeof requestAnimationFrame === "function") requestAnimationFrame(fix);
+  setTimeout(fix, 120);   // 收起预览区动画中
+  setTimeout(fix, 340);   // 动画结束 + 输入法弹起后
+}
+function focusEditorEnd(){
+  const e = el("editor"); if(!e) return;
+  setCaretEnd(e);                       // 必须先定光标:否则 focus() 会把 0 号位置滚进视口
+  try{ e.focus(); }catch(err){}
+  setCaretEnd(e);
+  pinEditorBottom(e);
+}
 function acceptDraft(){
   const ch = V2.curChapter;
   const body = el("draftText").value;
   if(!ch || !body.trim()) return;
+  const _ta = el("editor");
   undoStack.push(ch.body || "");              // 撤销可回退本次插入
   ch.body += (ch.body && !ch.body.endsWith("\n") ? "\n" : "") + body;
   saveProjects();
   renderEditor();
+  setCaretEnd(_ta);                          // 插入点在末尾,避免后续任何 focus 把视图拉回顶部
+  pinEditorBottom(_ta);                       // 20260916:视图留在末尾(修「点修改后跳回顶部」)
   el("draftText").value = "";
   el("draftText").readOnly = true;
   el("draftStatus").textContent = "已插入正文";
   setDraftActions(false);
   undoStackPushTrim();
 }
+/* ---------------- 预览区开关按钮的图标/语义唯一来源(任务书 260916b 任务1) ----------------
+ * 窄屏(≤900px)只有一个按钮:#togglePreview 被隐藏,#toggleThink 被复用为「展开/收起预览区」。
+ * 以前窄屏图标写死 🔳、title 还写着「思考面板」→ 语义误导。
+ * 现在:窄屏 → ⬆/⬇「展开/收起预览区」;宽屏 → 🧠(思考) + ⬇/⬆(预览) 两个按钮不变。
+ */
+function previewPanelOpen(){ const p = el("thinkPanel"); return !!(p && p.classList.contains("open")); }
+function syncPreviewIcon(){
+  let mob = false;
+  try{ mob = window.matchMedia("(max-width:900px)").matches; }catch(e){ mob = false; }
+  const t = el("toggleThink"), p = el("togglePreview"), open = previewPanelOpen();
+  if(mob){
+    if(t){
+      t.textContent = open ? "⬇" : "⬆";
+      t.title = open ? "收起预览区（思考+草稿）" : "展开预览区（思考+草稿）";
+    }
+  } else {
+    if(t){ t.textContent = "🧠"; t.title = "思考面板（折叠/展开思考过程）"; }
+  }
+  if(p){
+    p.textContent = open ? "⬇" : "⬆";
+    p.title = open ? "收起下方预览/思考区" : "恢复下方预览/思考区";
+  }
+}
 function collapsePreview(){
   // 窄屏「修改」插入正文后自动收起预览区(与 togglePreview 收起分支同逻辑)
   const p = el("thinkPanel"); if(!p || !p.classList.contains("open")) return;
   p.classList.remove("open");
   try{ localStorage.setItem("xietai.previewCollapsed.v1", "true"); }catch(e){}
-  const b = el("togglePreview");
-  if(b){ b.textContent = "⬆"; b.title = "恢复下方预览/思考区"; }
+  syncPreviewIcon();
 }
 function discardDraft(){
   el("draftText").value = "";
@@ -1122,27 +1408,58 @@ function togglePreview(){
   const hidden = el("thinkPanel").classList.toggle("open");  // open 控制显隐
   // 上面 toggle 返回 true 表示现在有 open(显示),false 表示已收起
   const collapsed = !hidden;
-  el("togglePreview").textContent = collapsed ? "⬆" : "⬇";
-  el("togglePreview").title = collapsed ? "恢复下方预览/思考区" : "收起下方预览/思考区";
+  syncPreviewIcon();
   localStorage.setItem("xietai.previewCollapsed.v1", collapsed);
 }
 function restorePreviewState(){
   // 思考块单独记忆
   if(localStorage.getItem("xietai.thinkCollapsed.v1") === "true"){
     el("thinkBlock").classList.add("collapsed");
-    el("toggleThink").textContent = "🧠";
-    el("toggleThink").title = "展开思考过程";
   }
   // 整面板:默认收起还是展开?用户若上次收起了,则不 add open
   if(localStorage.getItem("xietai.previewCollapsed.v1") === "true"){
     el("thinkPanel").classList.remove("open");
-    el("togglePreview").textContent = "⬆";
   } else {
     el("thinkPanel").classList.add("open");
-    el("togglePreview").textContent = "⬇";
   }
+  syncPreviewIcon();   // 图标由状态统一推导(竖屏=预览图标,横屏=🧠+⬇)
 }
 
+/* ---------------- 竖屏历史横滑卡片(任务书 260916b 任务2.3) ----------------
+ * 数据源与恢复逻辑完全复用现有实现: state.history({ts,text,model},新的在索引 0,最多 20 条)
+ * 与 useHistory(idx)(把该条载入草稿区并展开面板) → 横竖屏行为一致。
+ * 展示:左旧右新,默认滚到最右(最近一条),卡片宽 40%(一屏可见 2.5 张)。
+ */
+function histTimeText(ts){
+  const d = new Date(ts || Date.now()), p = n=>(""+n).padStart(2,"0");
+  return p(d.getMonth()+1)+"-"+p(d.getDate())+" "+p(d.getHours())+":"+p(d.getMinutes());
+}
+function renderMobHistStrip(){
+  const box = el("mobHistStrip");
+  if(!box) return;
+  box.title = "历史版本:左旧右新 · 点卡片恢复编辑 · 再点 🕘 关闭（不影响当前编辑）";
+  const all = state.history || [];
+  if(!all.length){ box.innerHTML = '<div class="hint hist-empty">暂无历史（生成一次后即可翻阅；再点 🕘 关闭）</div>'; return; }
+  const total = all.length;
+  box.innerHTML = "";
+  all.slice().reverse().forEach(h=>{                     // 反转 → 左旧右新
+    const idx = state.history.indexOf(h);
+    const d = document.createElement("div");
+    d.className = "hist-card";
+    d.innerHTML = '<div class="hc-meta">#'+(total-idx)+' · '+histTimeText(h.ts)+' · '+esc(h.model||"")+'</div>'
+                + '<div class="hc-text">'+esc(String(h.text||"").slice(0,160))+'</div>';
+    d.onclick = ()=>{ useHistory(idx); toggleMobHistStrip(false); };   // 点击即恢复(与横屏一致)
+    box.appendChild(d);
+  });
+  setTimeout(()=>{ if(box.scrollLeft !== undefined) box.scrollLeft = box.scrollWidth; }, 0);   // 停在最右(最近)
+}
+function toggleMobHistStrip(show){
+  const box = el("mobHistStrip");
+  if(!box) return;
+  const on = (show === undefined) ? (box.style.display !== "flex") : !!show;
+  if(on){ renderMobHistStrip(); box.style.display = "flex"; }
+  else box.style.display = "none";
+}
 /* 历史版本:左侧栏翻阅 + 复用 */
 function renderHistory(){
   const box = el("historyList");
@@ -1153,7 +1470,7 @@ function renderHistory(){
   if(!list.length){ box.innerHTML = '<div class="hint">'+ (state.history.length? "无匹配历史" : "暂无历史") +'</div>'; return; }
   box.innerHTML = "";
   list.slice().reverse().forEach((h, i) => {
-    // history 末尾最新；倒序后 i=0 是最近一条。原编号需还原
+    // history 末尾最新;倒序后 i=0 是最近一条。原编号需还原
     const realIdx = state.history.indexOf(h);
     const div = document.createElement("div");
     div.className = "hist-item";
@@ -1174,7 +1491,7 @@ function useHistory(idx){
   el("draftStatus").textContent = "来自历史 #"+(state.history.length-idx)+" · 已可编辑";
   setDraftActions(true);
   el("thinkPanel").classList.add("open");
-  el("togglePreview").textContent = "⬇";
+  syncPreviewIcon();
 }
 
 /* ---------------- 渲染 ---------------- */
@@ -1225,12 +1542,12 @@ function renderProjectTabs(){
   const box = el("projectTabs");
   if(!box) return;
   box.innerHTML = "";
-  // 从磁盘作品集读取（/api/works），点击即切换该作品并联动其宇宙
+  // 从磁盘作品集读取(/api/works),点击即切换该作品并联动其宇宙
   (V2.works||[]).forEach(w=>{
     const b = document.createElement("button");
     b.className = "tab" + (w.id===V2.curWorkId ? " active":"");
     b.textContent = w.name || "未命名";
-    b.title = "切换到作品集（自动联动其宇宙）";
+    b.title = "切换到作品集(自动联动其宇宙)";
     b.onclick = async ()=>{ await onSelectWork(w.id); renderWorldBrowser(); renderProjectTabs(); };
     box.appendChild(b);
   });
@@ -1307,7 +1624,7 @@ function describeErr(e, url){
 
 /* ---------------- 连接 / 模型 ---------------- */
 /* 轻量连接探测:只更新连接状态,不碰参数、不重刷模型列表 */
-/* 轻量连接探测：静默模式（默认）——成功不提示，仅超时/断开显示红字；每次续写强制扫描一次 */
+/* 轻量连接探测:静默模式(默认)--成功不提示,仅超时/断开显示红字;每次续写强制扫描一次 */
 async function probeConnection(quiet=true){
   try{
     const probeUrl = (state.cfg.backend === "online") ? apiBase() + "/models" : state.cfg.ollamaUrl + "/api/tags";
@@ -1327,7 +1644,7 @@ async function probeConnection(quiet=true){
     return false;
   }
 }
-/* 完整刷新:拉模型列表 + 恢复上次选择 + 套用预设（成功静默，失败红字提示） */
+/* 完整刷新:拉模型列表 + 恢复上次选择 + 套用预设(成功静默,失败红字提示) */
 async function loadModels(){
   if(state.cfg.backend === "online"){
     try{
@@ -1349,7 +1666,7 @@ async function loadModels(){
       el("modelSel").innerHTML = "<option>加载失败</option>";
       el("connHint").textContent = "⚠ 在线 API 不可用:" + describeErr(e, apiBase());
       el("connHint").classList.add("err");
-      // 列表不可用也恢复上次模型选择并套用绑定配置（生成失败会另行提示，配置不再"看起来丢失"）
+      // 列表不可用也恢复上次模型选择并套用绑定配置(生成失败会另行提示,配置不再"看起来丢失")
       const last = localStorage.getItem(LS_MODEL);
       if(last && !state.model){ state.model = last; onModelSwitch(last, true); }
       return;
@@ -1388,8 +1705,21 @@ function syncParamUI(){
     ["max_tokens","pMaxTok","oMaxTok"],
   ];
   for(const [k, pid, oid] of map){
-    if(el(pid)) el(pid).value = state.params[k];
-    if(el(oid)) el(oid).textContent = state.params[k];
+    const v = (k === "max_tokens") ? requestMaxTokens() : state.params[k];
+    if(el(pid)) el(pid).value = v;
+    if(el(oid)) el(oid).textContent = v;
+  }
+  // 偏移提示:基准值由滑块给出,生效值 = 基准 + 风格偏移
+  const hint = el("paramHint");
+  if(hint){
+    const st = activeStyle(); const d = currentDelta();
+    if(!st || !Object.keys(d).length){
+      hint.textContent = "当前无风格偏移：生效值 = 基准值";
+    } else {
+      const eff = effectiveParams();
+      hint.textContent = "风格「" + (st.name||st.id) + "」强度 " + Math.round((Number(st.s)||0)*100) + "% → "
+        + Object.keys(d).map(k=> k + " " + (d[k]>0?"+":"") + d[k] + "（生效 " + eff[k] + "）").join(" · ");
+    }
   }
 }
 
@@ -1398,7 +1728,7 @@ function bind(){
   el("genBtn").onclick = doGenerate;
   el("regenBtn").onclick = doGenerate;
   el("mobRedo").onclick = ()=>{ discardDraft(); doGenerate(); };                          // 重做=放弃并重新生成
-  el("mobEdit").onclick = ()=>{ acceptDraft(); collapsePreview(); setTimeout(()=>{ const _e=el("editor"); if(_e) _e.focus(); }, 60); };  // 修改=插入并呼出输入法
+  el("mobEdit").onclick = ()=>{ acceptDraft(); collapsePreview(); setTimeout(focusEditorEnd, 60); };  // 修改=插入并呼出输入法(光标置末尾,不再被 focus 拉回顶部)
   el("mobCont").onclick = ()=>{ acceptDraft(); doGenerate(); };                          // 继续=插入并继续生成
   el("acceptBtn").onclick = acceptDraft;
   el("discardBtn").onclick = discardDraft;
@@ -1426,7 +1756,7 @@ function wsMask(show){ const _m = el("wsMask"); if(_m){ _m.style.display = (show
   el("clearThink").onclick = ()=>{ el("thinkText").textContent=""; el("draftText").textContent=""; };
   // 历史搜索 / 清空
   if(el("histSearch")) el("histSearch").oninput = ()=> renderHistory();
-  if(el("histClear")) el("histClear").onclick = ()=>{ if(confirm("清空全部历史版本？当前正文不会被删除。")){ state.history = []; saveProjects(); renderHistory(); } };
+  if(el("histClear")) el("histClear").onclick = ()=>{ if(confirm("清空全部历史版本?当前正文不会被删除。")){ state.history = []; saveProjects(); renderHistory(); } };
   // v2 世界面板搜索 / 排序
   if(el("v2EntrySearch")) el("v2EntrySearch").oninput = ()=> renderV2WorldPanel();
   if(el("v2EntrySort")) el("v2EntrySort").onchange = ()=> renderV2WorldPanel();
@@ -1455,12 +1785,13 @@ function wsMask(show){ const _m = el("wsMask"); if(_m){ _m.style.display = (show
   el("openParams").onclick = ()=>{
     // 拉起弹窗时,把当前生效值灌入控件
     syncParamUI();
+    const mt = el("pMaxTok"); if(mt) mt.oninput = ()=>{ state.cfg.maxTokens = Number(mt.value) || CONFIG.defaultMaxTokens; const o=el("oMaxTok"); if(o) o.textContent = state.cfg.maxTokens; saveCfg(); };
     el("paramSheet").classList.add("open");
   };
   el("closeParams").onclick = ()=> el("paramSheet").classList.remove("open");
   el("paramSheet").onclick = e=>{ if(e.target===el("paramSheet")) el("paramSheet").classList.remove("open"); };
   el("presetDefault").onclick = ()=>{
-    applyParams({ ...(BUILTIN_PRESETS.defaultPreset?.params||DEFAULT_PARAMS), max_tokens:state.params.max_tokens });
+    applyParams({ ...(BUILTIN_PRESETS.defaultPreset?.params||DEFAULT_PARAMS) });
     if(state.modelCfg[state.model]) delete state.modelCfg[state.model].params;  // 清专属预设回默认
     saveModelCfg();
     el("presetHint").textContent = "已恢复默认(并清除该模型专属预设)";
@@ -1529,11 +1860,11 @@ function wsMask(show){ const _m = el("wsMask"); if(_m){ _m.style.display = (show
     state.cfg.fontScale = Number(el("cfgFontScale").value) || 1;
     applyFontScale(state.cfg.fontScale);
     saveCfg(); loadModels();
-    if(REMOTE){   // 远程设备:密钥/地址存电脑端,手机浏览器不再持有
+    if(REMOTE){   // 远程设备:只同步地址(Base/Ollama);密钥只存本机,服务端不持有
       fetch("/api/servercfg", { method:"PUT", headers:{"Content-Type":"application/json"},
-        body: JSON.stringify({ onlineBase: state.cfg.onlineBase, onlineKey: state.cfg.onlineKey || "", ollamaUrl: state.cfg.ollamaUrl }) });
+        body: JSON.stringify({ onlineBase: state.cfg.onlineBase, ollamaUrl: state.cfg.ollamaUrl }) });
     }
-    hideGateHint();   // 切换后端模式：隐藏上次生成的残留提示
+    hideGateHint();   // 切换后端模式:隐藏上次生成的残留提示
     renderSanitizeBtn();   // 切模式刷新「一键安全/恢复原文」按钮状态
     el("cfgSheet").classList.remove("open");
   };
@@ -1559,24 +1890,29 @@ function wsMask(show){ const _m = el("wsMask"); if(_m){ _m.style.display = (show
   el("connHint").style.cursor = "pointer";
   el("connHint").title = "点击重新检测连接";
   el("connHint").onclick = ()=> loadModels();
-  // 提示词工具页：新建 / 恢复内置
+  // 提示词工具页:新建 / 恢复内置
   const stAdd = el("styleAdd"); if(stAdd) stAdd.onclick = addStyle;
-  const stReset = el("styleReset"); if(stReset) stReset.onclick = resetStyles;
-  const piAdd = el("piAdd"); if(piAdd) piAdd.onclick = addPromptItem;
+  const clrLocal = el("prefClearLocal"); if(clrLocal) clrLocal.onclick = ()=> clearBrowserPrefs();
+  const sysOpenBtn = el("sysOpenBtn"); if(sysOpenBtn) sysOpenBtn.onclick = ()=>{ const b = el("openSys"); if(b) b.click(); else v2Toast("请用顶栏齿轮打开系统设置", "err"); };
+  const tplCancel = el("tplCancel"); if(tplCancel) tplCancel.onclick = ()=>{ const s = el("tplSheet"); if(s) s.classList.remove("open"); };
+  const tplSheetEl = el("tplSheet"); if(tplSheetEl) tplSheetEl.onclick = e=>{ if(e.target === tplSheetEl) tplSheetEl.classList.remove("open"); };
+  // [已移除·20260916 用户要求] 提示词条目 UI 入口（功能与注入链路保留，仅去掉预设管理页的展示）
+  // 恢复方式见 续写台/archives/remove_promptitems_20260916/REMOVED.md
+  // const piAdd = el("piAdd"); if(piAdd) piAdd.onclick = addPromptItem;
   /* 开发者设置(已隐藏,发布版): 原 SafeGate 开关绑定已移除,在线过滤默认开启 */
-  //   // 开发者设置：在线过滤（SafeGate）开关
+  //   // 开发者设置:在线过滤(SafeGate)开关
   //   const devSG = el("devSafeGate");
   //   if(devSG){
   //     devSG.checked = state.cfg.safeGate !== false;
   //     devSG.onchange = ()=>{
   //       state.cfg.safeGate = devSG.checked;
   //       saveCfg();
-  //       hideGateHint();   // 开关切换：隐藏残留提示
+  //       hideGateHint();   // 开关切换:隐藏残留提示
   //       renderSanitizeBtn();
-  //       v2Toast(devSG.checked ? "在线过滤已开启：在线模式下⚠️条目等同关闭" : "在线过滤已关闭：⚠️条目恢复原设置", devSG.checked ? "ok" : "err");
+  //       v2Toast(devSG.checked ? "在线过滤已开启:在线模式下⚠️条目等同关闭" : "在线过滤已关闭:⚠️条目恢复原设置", devSG.checked ? "ok" : "err");
   //     };
   //   }
-  // 词库管理：转化入口
+  // 词库管理:转化入口
   const ruleBuild = el("ruleBuild");
   if(ruleBuild) ruleBuild.onclick = buildUserRule;
 }
@@ -1598,19 +1934,19 @@ function bindWmTabs(){
   tu.onclick = ()=> show(false);
 }
 
-/* 平行宇宙浮层(🌏,移动端):与🌐同款交互——气泡跳转编辑/✕移除/空白展开候选绑定 */
+/* 平行宇宙浮层(🌏,移动端):与🌐同款交互--气泡跳转编辑/✕移除/空白展开候选绑定 */
 async function renderUniInfoPop(){
   const box = el("v2UniPop"); if(!box) return;
   await Promise.all([ loadUniverses(), loadWorldBooks() ]);
   const sel0 = V2.selection || {};
   const u = (V2.universes||[]).find(x=>x.id===sel0.universe);
   if(!u){
-    box.innerHTML = '<div class="v2-pop-title">平行宇宙</div><div class="v2-pop-hint">当前未选择宇宙（在工作台左侧世界浏览器选择）</div>';
+    box.innerHTML = '<div class="v2-pop-title">平行宇宙</div><div class="v2-pop-hint">当前未选择宇宙(在工作台左侧世界浏览器选择)</div>';
     return;
   }
   const bound = (u.worldBookIds||[]).map(id=>V2.wbCache[id]).filter(Boolean);
   box.innerHTML = `<div class="v2-pop-title">平行宇宙 · ${esc(u.name||"未命名")}</div>
-    <div class="v2-pop-hint">点击气泡 → 跳转编辑；点 ✕ 移除；点空白处展开候选</div>
+    <div class="v2-pop-hint">点击气泡 → 跳转编辑;点 ✕ 移除;点空白处展开候选</div>
     <div class="v2-pop-pops">${bound.length
       ? bound.map(wb=>`<span class="v2-pop-bubble" data-wbid="${esc(wb.id)}">📖 ${esc(wb.name||wb.id)} <span class="x" data-wbid="${esc(wb.id)}">✕</span></span>`).join("")
       : `<span class="v2-pop-empty">该宇宙还没有世界书</span>`}</div>
@@ -1630,15 +1966,15 @@ async function renderUniInfoPop(){
   });
   await renderUniCands(box, u);
 }
-/* 🌏 候选：未绑定到当前宇宙的书 → 点击绑定(与🌐候选同款) */
+/* 🌏 候选:未绑定到当前宇宙的书 → 点击绑定(与🌐候选同款) */
 async function renderUniCands(box, u){
   const candsBox = box.querySelector(".v2-pop-cands"); if(!candsBox) return;
   const bound = u.worldBookIds||[];
   const cands = (V2.worldBooks||[]).filter(w=>!bound.includes(w.id));
   if(!cands.length){
-    candsBox.innerHTML = `<div class="v2-pop-cands-title">（世界书库已全部绑定或为空，可先去世界管理页导入）</div>`;
+    candsBox.innerHTML = `<div class="v2-pop-cands-title">(世界书库已全部绑定或为空,可先去世界管理页导入)</div>`;
   } else {
-    candsBox.innerHTML = `<div class="v2-pop-cands-title">点击绑定到本宇宙：</div>`
+    candsBox.innerHTML = `<div class="v2-pop-cands-title">点击绑定到本宇宙:</div>`
       + cands.map(w=>`<div class="v2-pop-cand" data-wbid="${esc(w.id)}">📖 ${esc(w.name)}<span class="cnt">${w.entryCount||0} 条</span></div>`).join("");
     candsBox.querySelectorAll(".v2-pop-cand").forEach(c=>{
       c.onclick = async ()=>{
@@ -1670,7 +2006,7 @@ async function gotoWbEditor(wbid){
 }
 
 /* 移动端浮层:页面菜单(汉堡) + 模型选择 */
-/* 移动端:点击正文区收回打开的抽屉(左世界浏览器/右设定池) — 下意识操作 */
+/* 移动端:点击正文区收回打开的抽屉(左世界浏览器/右设定池) - 下意识操作 */
 function bindDismissDrawers(){
   document.addEventListener("pointerdown", (e)=>{
     if(!matchMedia("(max-width:900px)").matches) return;
@@ -1703,14 +2039,39 @@ function bindMobPopups(){
       mPop.style.display = "none";
     };
   }
+  // 任务2.2:聚合入口 [▼](原独立「自动脱敏」位置) → 竖排弹窗:👁 查看请求 + 🛡 自动脱敏
+  const moreBtn = el("mobMoreBtn"), morePop = el("mobMorePop");
+  if(moreBtn && morePop){
+    moreBtn.onclick = e=>{
+      e.stopPropagation();
+      if(navPop) navPop.style.display = "none";
+      if(mPop) mPop.style.display = "none";
+      if(stPop) stPop.style.display = "none";
+      morePop.style.display = morePop.style.display === "block" ? "none" : "block";
+    };
+    const vm = el("viewReqM");
+    if(vm) vm.onclick = ()=>{ morePop.style.display = "none"; showRequest(); };
+    const sm = el("safeBtnM");
+    if(sm) sm.onclick = ()=>{ toggleSafeAuto(); renderSanitizeBtn(); };   // 不关弹窗:便于直接看到开关状态
+  }
   const stBtn = el("mobStyleBtn"), stPop = el("mobStylePop");
   if(stBtn && stPop){
     const fillStylePop = ()=>{
       const ssel = el("mobStyleSel"); if(!ssel) return;
       ssel.innerHTML = "";
-      (state.styles||[]).forEach(p=>{
+      const co = document.createElement("option");
+      co.value = CUSTOM_STYLE.id; co.textContent = CUSTOM_STYLE.name;
+      if(CUSTOM_STYLE.id === state.style) co.selected = true;
+      ssel.appendChild(co);
+      (state.styles||[]).forEach(p=>{ if(!p || p.id === CUSTOM_STYLE.id) return;
         const o = document.createElement("option");
         o.value = p.id; o.textContent = p.name;
+        if(p.id === state.style) o.selected = true;
+        ssel.appendChild(o);
+      });
+      ((state.browserPrefs&&state.browserPrefs.styles)||[]).forEach(p=>{ if(!p || p.id === CUSTOM_STYLE.id) return;
+        const o = document.createElement("option");
+        o.value = p.id; o.textContent = (p.name||p.id) + "(浏览器版本)";
         if(p.id === state.style) o.selected = true;
         ssel.appendChild(o);
       });
@@ -1724,7 +2085,7 @@ function bindMobPopups(){
       stPop.style.display = "block";
     };
     const ssel = el("mobStyleSel");
-    if(ssel) ssel.onchange = ()=>{ applyStyle(ssel.value, true); v2Toast("文风已切换:"+(state.styles.find(x=>x.id===ssel.value)||{}).name||ssel.value, "ok"); };
+    if(ssel) ssel.onchange = ()=>{ applyStyle(ssel.value, true); v2Toast("文风已切换:"+((findStyleById(ssel.value)||{}).name||ssel.value), "ok"); };
     const ssave = el("mobStyleSave");
     if(ssave) ssave.onclick = ()=>{
       const sp = el("mobSysPrompt"); if(sp){ state.sysPrompt = sp.value; saveSysSettings(); }
@@ -1739,15 +2100,16 @@ function bindMobPopups(){
       if(mPop) mPop.style.display = "none";
       const gpop = el("v2GlobalPop"); if(gpop) gpop.classList.remove("open");
       if(uniPop.classList.contains("open")){ uniPop.classList.remove("open"); return; }
-      uniPop.classList.add("open"); uniPop.innerHTML = '<div class="v2-pop-title">平行宇宙</div><div class="v2-pop-hint">加载中…</div>';
+      uniPop.classList.add("open"); uniPop.innerHTML = '<div class="v2-pop-title">平行宇宙</div><div class="v2-pop-hint">加载中...</div>';
       await renderUniInfoPop();
     };
   }
   document.addEventListener("click", e=>{
-    if(e.target.closest(".mob-pop") || e.target.closest("#v2UniPop") || e.target.closest("#mobNavBtn") || e.target.closest("#mobModelBtn") || e.target.closest("#mobUniBtn") || e.target.closest("#mobStyleBtn")) return;
+    if(e.target.closest(".mob-pop") || e.target.closest("#v2UniPop") || e.target.closest("#mobNavBtn") || e.target.closest("#mobModelBtn") || e.target.closest("#mobUniBtn") || e.target.closest("#mobStyleBtn") || e.target.closest("#mobMoreBtn")) return;
     if(navPop) navPop.style.display = "none";
     if(mPop) mPop.style.display = "none";
     if(stPop) stPop.style.display = "none";
+    if(morePop) morePop.style.display = "none";
     if(uniPop) uniPop.classList.remove("open");
   });
 }
@@ -1770,8 +2132,7 @@ function mobLayout(){
   if(!seg || !gb || !cur) return;
   const head = cur.parentNode, mcb = el("mobChapterBar");
   const topR = document.querySelector(".top-right"), v2bar = document.querySelector(".v2-bar"), cmp = document.querySelector(".composer");
-  const tk = el("toggleThink");
-  if(tk) tk.textContent = mob ? "🔳" : "🧠";  // 移动端🔲折叠预览 / 桌面🧠思考折叠
+  syncPreviewIcon();   // 任务1:窄屏=⬆/⬇(展开预览),宽屏=🧠(思考);旋转/尺寸变化都会重跑这里
   const gpop = el("v2GlobalPop");
   if(mob){
     if(seg.parentNode !== head) head.insertBefore(seg, mcb);                  // 模式→标题行(章节前)
@@ -1792,7 +2153,7 @@ async function init(){
   bindWmTabs();
   updateMobPageTitle();
   window.addEventListener("resize", ()=>{ mobLayout(); });
-  // 远程访问(手机/平板):拉取服务端配置(在线 Base/Ollama 地址;密钥存电脑,不回传) — 远程设备零配置
+  // 远程访问(手机/平板):拉取服务端地址配置(在线 Base/Ollama 地址;密钥不回传、服务端也不持有)
   if(REMOTE){
     try{
       const _r = await fetch("/api/servercfg");
@@ -1801,6 +2162,12 @@ async function init(){
       if(sc.ollamaUrl) state.cfg.ollamaUrl = sc.ollamaUrl;
     }catch(e){}
   }
+  // 需求1/5:预设以服务端 prefs.json 为唯一权威;启动只读服务端,
+  // localStorage 残留仅登记为「浏览器版本预设」(不自动上推、不作默认值)
+  await loadPrefsFromServer();
+  // D4C:密钥不在浏览器存储里,由 Android Keystore 提供;仅在本地为空时注入,不覆盖用户手填
+  try{ if(!state.cfg.onlineKey){ const bk = bridgeKey(); if(bk) state.cfg.onlineKey = bk; } }catch(e){}
+  detectBrowserPrefs();
   await loadBuiltinPresets();
   populateStyleSel();
   applyStyle(state.style, false);
@@ -1810,7 +2177,10 @@ async function init(){
   renderHistory();
   restorePreviewState();
   state.initDone = true;
-  // 刷新时自动整理索引：清理悬空引用（宇宙/作品/全局激活表），静默，失败无害
+  // 需求5:不再有任何"本地有值就自动上推/兜底"的行为;仅刷新预设相关 UI
+  renderStyleList(); renderPromptItems(); renderSysBrowser(); updatePrefsToolbar();
+  populateStyleSel();
+  // 刷新时自动整理索引:清理悬空引用(宇宙/作品/全局激活表),静默,失败无害
   fetchWithTimeout(location.origin + "/api/cleanup", { cache:"no-store" }, 8000).catch(()=>{});
   // ★ 启动性能:正文数据(本地 serve)与模型列表(远程 Ollama)互不依赖 → 并行加载。
   //   之前 loadModels 先 await,远程隧道一卡(8s 超时)正文就跟着等,刷新后要 ~10s 才出字。
@@ -1829,7 +2199,7 @@ async function init(){
   };
   probeLoop();
 }
-// v2 状态命名空间（新语义：宇宙 Universe / 作品 Work / 章节 Chapter / 世界书 WorldBook）
+// v2 状态命名空间(新语义:宇宙 Universe / 作品 Work / 章节 Chapter / 世界书 WorldBook)
 const V2 = {
   universes: [],           // 宇宙列表 [{id,name,worldBookIds}]
   curUniverseId: null,     // 当前选中宇宙
@@ -1838,40 +2208,49 @@ const V2 = {
   curWorkId: null,         // 当前选中作品
   curWork: null,           // 完整作品 {id,name,universeId,chapterIds}
   workChapters: [],        // 当前作品的章节轻量列表 [{id,title}]
-  chaptersCache: {},       // 作品章节缓存 workId -> [{id,title}]（左侧树展开任意作品集用）
+  chaptersCache: {},       // 作品章节缓存 workId -> [{id,title}](左侧树展开任意作品集用)
   curChapterId: null,      // 当前章节
   curChapter: null,        // 完整章节 {id,title,tags,body,disabledEntryIds}
   worldBooks: [],          // 世界书库轻量列表 [{id,name,entryCount}]
-  wbCache: {},             // 完整世界书缓存 id -> wb（ST 规范原样）
-  globalActiveWB: [],      // 全局激活世界书 id 列表（来自 _global.json）
+  wbCache: {},             // 完整世界书缓存 id -> wb(ST 规范原样)
+  globalActiveWB: [],      // 全局激活世界书 id 列表(来自 _global.json)
   globalSheetOpen: false,
   worldManagerOpen: false,
   loading: false,
   selection: { universe:null, work:null, chapter:null }, // 三级下钻选中态
-  openUniverses: {},       // 展开的宇宙（id -> true）
-  openWorks: {},           // 展开的作品（id -> true）
+  openUniverses: {},       // 展开的宇宙(id -> true)
+  openWorks: {},           // 展开的作品(id -> true)
 };
 
-// v2 全局激活世界书（最高优先级，独立于宇宙/作品）——与 _global.json 同步
+// v2 全局激活世界书(最高优先级,独立于宇宙/作品)--与 _global.json 同步
 let V2_GLOBAL_ACTIVE = new Set();
 
 function v2Server(){ return location.origin; }
-/* 在线 API Base（OpenAI 兼容），去尾部斜杠 */
+/* 在线 API Base(OpenAI 兼容),去尾部斜杠 */
 function apiBase(){ return String(state.cfg.onlineBase || "https://api.siliconflow.cn/v1").replace(/\/+$/, ""); }
-/* 后端模式切换：只显示对应模式的输入栏 */
+/* 后端模式切换:只显示对应模式的输入栏 */
 function syncCfgBackendUI(){
   const b = el("cfgBackend") ? el("cfgBackend").value : (state.cfg.backend || "local");
   document.querySelectorAll(".cfg-local").forEach(x=>{ x.style.display = (b === "local" ? "" : "none"); });
   document.querySelectorAll(".cfg-online").forEach(x=>{ x.style.display = (b === "online" ? "" : "none"); });
 }
-/* 在线平台预设：选平台自动填 Base URL（custom=手填） */
+/* 在线平台预设:选平台自动填 Base URL(custom=手填) */
 function setOnlinePlatform(v){
   const base = el("cfgOnlineBase");
   if(!base) return;
   if(v === "siliconflow") base.value = "https://api.siliconflow.cn/v1";
   else if(v === "deepseek") base.value = "https://api.deepseek.com/v1";
 }
-function apiHeaders(){ return { "Content-Type":"application/json", "Authorization":"Bearer " + (state.cfg.onlineKey || "") }; }
+/* D4C 壳(Android)密钥:由 JS Bridge 提供,存入 Android Keystore,明文不进 URL/cookie/localStorage。
+   浏览器环境无 native 桥 → 行为与以前完全一致。 */
+function bridgeKey(){
+  try{ return (window.native && window.native.getApiKey) ? String(window.native.getApiKey() || "") : ""; }
+  catch(e){ return ""; }
+}
+function apiHeaders(){
+  const k = state.cfg.onlineKey || bridgeKey();
+  return { "Content-Type":"application/json", "Authorization":"Bearer " + k };
+}
 async function apiV2(method, path, body, silent= true, headers={}){
   const url = v2Server() + path;
   const opts = { method, headers:{ ...headers } };
@@ -1890,8 +2269,8 @@ async function apiV2(method, path, body, silent= true, headers={}){
 
 function enc(s){ return encodeURIComponent(String(s)); }
 
-/* ================ 安全闸门 SafeGate（出站条目过滤） ================
- * 机制: 顶部选择在线模式时,⚠️标记条目的注入等同「关闭」——优先于词条自身的
+/* ================ 安全闸门 SafeGate(出站条目过滤) ================
+ * 机制: 顶部选择在线模式时,⚠️标记条目的注入等同「关闭」--优先于词条自身的
  *       常驻/逻辑/向量模式,在激活判定源头排除;不修改词条原设置(enabled/disable
  *       字段不动),切回本地模式自动恢复用户原设置。
  * 开关: 「提示词工具-开发者设置-在线过滤」可整体关闭(技术中性是声明,不是强制要求)。
@@ -1945,7 +2324,7 @@ async function loadUniverses(){ V2.universes = (await apiV2("GET", "/api/univers
 async function loadUniverse(id){
   V2.curUniverse = await apiV2("GET", "/api/universes/" + enc(id));
   V2.curUniverseId = id;
-  // 并行拉该宇宙绑定的世界书详情入缓存（供右侧面板/注入使用）
+  // 并行拉该宇宙绑定的世界书详情入缓存(供右侧面板/注入使用)
   if(V2.curUniverse && Array.isArray(V2.curUniverse.worldBookIds)){
     await Promise.all(V2.curUniverse.worldBookIds.map(wb=>loadWorldBook(wb).catch(()=>null)));
   }
@@ -1964,7 +2343,7 @@ async function loadWork(id){
     const r = await apiV2("GET", "/api/works/" + enc(id) + "/chapters");
     V2.workChapters = (r && r.chapters) || [];
   }
-  // 缓存章节列表（左侧树展开任意作品集都显示自己的章节，不串目录）
+  // 缓存章节列表(左侧树展开任意作品集都显示自己的章节,不串目录)
   V2.chaptersCache[id] = V2.workChapters;
   return V2.curWork;
 }
@@ -1991,14 +2370,14 @@ async function importWorldBook(stJson){ const r = await apiV2("POST", "/api/worl
 async function loadGlobal(){ const g = await apiV2("GET", "/api/global"); V2.globalActiveWB = (g && g.globalActiveWB) || []; V2_GLOBAL_ACTIVE = new Set(V2.globalActiveWB); return V2.globalActiveWB; }
 async function saveGlobal(){ await apiV2("PUT", "/api/global", { globalActiveWB: V2.globalActiveWB || [] }); }
 
-// ---- 激活解析（全局 ∪ 宇宙，服务端并集） ----
+// ---- 激活解析(全局 ∪ 宇宙,服务端并集) ----
 async function apiResolve(universeId){
   return await apiV2("GET", "/api/resolve", undefined, true, { "X-Universe": universeId || "" });
 }
 
-/* ---------------- 激活状态计算（新模型） ----------------
- * 激活集 = 全局激活(globalActiveWB) ∪ 当前宇宙 worldBookIds，并集去重；
- * 章节 disabledEntryIds 做条目级局部屏蔽（存于章节文件，不污染世界书本体）。
+/* ---------------- 激活状态计算(新模型) ----------------
+ * 激活集 = 全局激活(globalActiveWB) ∪ 当前宇宙 worldBookIds,并集去重;
+ * 章节 disabledEntryIds 做条目级局部屏蔽(存于章节文件,不污染世界书本体)。
  */
 function computeActiveEntries(){
   const result = [];
@@ -2031,7 +2410,7 @@ function computeActiveEntries(){
       if(dis.has(eid) || dis.has(String(result[i].entryId))) result.splice(i, 1);
     }
   }
-  // SafeGate：在线模式下 ⚠️标记词条等同关闭（优先于常驻/逻辑/向量模式；不修改词条原设置，切回本地自动恢复）
+  // SafeGate:在线模式下 ⚠️标记词条等同关闭(优先于常驻/逻辑/向量模式;不修改词条原设置,切回本地自动恢复)
   if(SG_ACTIVE()){
     for(let i = result.length - 1; i >= 0; i--){
       const e = result[i].entry;
@@ -2042,17 +2421,17 @@ function computeActiveEntries(){
   return result;
 }
 
-/* ---------------- WorldBook 触发机制（完全对齐 SillyTavern 原版语义） ----------------
+/* ---------------- WorldBook 触发机制(完全对齐 SillyTavern 原版语义) ----------------
  * 存储字段与 ST 一致: constant / vectorized / selective / selectiveLogic(0=AND_ANY,1=NOT_ALL,2=NOT_ANY,3=AND_ALL) / scan
  * 激活顺序(ST world-info.js 4130-4265):
  *   1) constant=true → 直接激活(不扫描、不看词、不受扫描开关限制)
  *   2) 主词(keys)为空 → 跳过(副触发词不能独立触发)
  *   3) 主词命中(任一 keys,按 caseSensitive/matchWholeWords) → 无副词:直接激活
- *   4) 有副词:按 selectiveLogic 判定 —— AND_ANY(任一)/AND_ALL(全部)/NOT_ALL(非全部=反触发)/NOT_ANY(无任何=反触发)
+ *   4) 有副词:按 selectiveLogic 判定 -- AND_ANY(任一)/AND_ALL(全部)/NOT_ALL(非全部=反触发)/NOT_ANY(无任何=反触发)
  * 扫描开关: 全局 cfg.scanEnabled(关=仅常驻注入) + 条目级 e.scan(false=不参与扫描不触发) + 章节 disabledEntryIds 局部屏蔽
  */
-let _vecCache = {};  // "wbId:eid" -> bool（向量匹配结果缓存）
-/* 插入位置：自有映射（中文 UI；存储沿用 ST 的 position 0-6，导出兼容）
+let _vecCache = {};  // "wbId:eid" -> bool(向量匹配结果缓存)
+/* 插入位置:自有映射(中文 UI;存储沿用 ST 的 position 0-6,导出兼容)
  * 0 开头       → prompt 最前(系统词之前)          [ST before]
  * 1 设定区     → 系统区末尾(常驻设定之后)          [ST after]
  * 2 作者注前   → 设定区·作者注之前                 [ST ANTop]
@@ -2085,28 +2464,28 @@ function entryMatches(e, text, hitKey){
   if(e.enabled === false || e.disable === true || e.level === "disabled") return false;
   const mode = entryMode(e);
   if(mode === "constant") return true;                       // ST: constant 直接激活
-  if(state.cfg.scanEnabled === false) return false;          // 全局扫描关：仅常驻注入
+  if(state.cfg.scanEnabled === false) return false;          // 全局扫描关:仅常驻注入
   if(e.scan === false) return false;                         // 条目级扫描关
-  if(mode === "vector") return _vecCache[hitKey||""] === true; // 向量：refreshVectorMatches 异步算好缓存
-  // -- 逻辑(selective)模式:完全复刻 ST 激活顺序 --
+  if(mode === "vector") return _vecCache[hitKey||""] === true; // 向量:refreshVectorMatches 异步算好缓存
+  // -- 逻辑(selective)模式: A(主词) & B(副词/过滤器) 逻辑门 --
+  //     OR(任意): 主∨副 任一命中即触发(副词可独立触发)
+  //     AND(与所有): 主∧副 同时命中才触发
+  //     NAND(非所有): 非(主∧副全命中) 即触发(排除"主副同时命中")
+  //     NOR(非任何): 主∨副 都不命中才触发(反触发,用于"不满足条件时生效")
   const keys = (e.keys||[]).filter(Boolean);
-  if(!keys.length) return false;                             // ST: 主词为空跳过(副词不能独立触发)
-  const kHit = keys.some(k=>keyHit(k, text, e));
-  if(!kHit) return false;                                    // ST: 主词不中跳过
   const secs = (e.keysecondary||[]).filter(Boolean);
-  if(!secs.length) return true;                              // ST: 主中+无副词=直接激活
-  const logic = (e.selectiveLogic !== undefined && e.selectiveLogic !== null) ? Number(e.selectiveLogic) : 0;  // 缺省 AND_ANY
-  const sHits = secs.map(k=>keyHit(k, text, e));
-  const anyS = sHits.some(Boolean);
-  const allS = sHits.every(Boolean);
+  if(!keys.length && !secs.length) return false;             // 无任何触发词 → 不激活
+  const kHit = keys.length ? keys.some(k=>keyHit(k, text, e)) : false;
+  const sHit = secs.length ? secs.some(k=>keyHit(k, text, e)) : false;
+  const logic = (e.selectiveLogic !== undefined && e.selectiveLogic !== null) ? Number(e.selectiveLogic) : 0;
   switch(logic){
-    case 3: return allS;   // AND_ALL: 全部副词命中
-    case 2: return !anyS;  // NOT_ANY: 无任何副词命中(有副词命中=排除)
-    case 1: return !allS;  // NOT_ALL: 非全部副词命中(全部命中=排除)
-    default: return anyS;  // AND_ANY: 任一副词命中
+    case 3: return kHit && sHit;       // AND(与所有): 主且副同时命中
+    case 1: return !(kHit && sHit);    // NAND(非所有): 非(主且副全命中)
+    case 2: return !(kHit || sHit);    // NOR(非任何): 主副都不命中
+    default: return kHit || sHit;      // OR(任意): 主或副任一命中
   }
 }
-/* 向量模式：正文与条目内容 embedding 余弦相似度 >= 阈值(默认0.6) */
+/* 向量模式:正文与条目内容 embedding 余弦相似度 >= 阈值(默认0.6) */
 async function embedText(t){
   try{
     if(state.cfg.backend === "online"){
@@ -2135,7 +2514,7 @@ function cosine(a, b){
   for(let i=0;i<a.length;i++){ dot += a[i]*b[i]; na += a[i]*a[i]; nb += b[i]*b[i]; }
   return (na && nb) ? dot/(Math.sqrt(na)*Math.sqrt(nb)) : 0;
 }
-/* 生成前调用：扫描正文，为 vector 条目算匹配结果（条目 embedding 缓存，正文每次重算） */
+/* 生成前调用:扫描正文,为 vector 条目算匹配结果(条目 embedding 缓存,正文每次重算) */
 async function refreshVectorMatches(text){
   if(state.cfg.scanEnabled === false){ _vecCache = {}; return; }
   if(!V2.curUniverseId || !V2.curUniverse) return;
@@ -2143,7 +2522,7 @@ async function refreshVectorMatches(text){
   const vecs = all.filter(x => entryMode(x.entry)==="vector" && x.entry.scan !== false);
   if(!vecs.length){ _vecCache = {}; return; }
   const tEmb = await embedText(text||"");
-  if(!tEmb) return;   // embedding 不可用：向量条目不触发(静默降级)
+  if(!tEmb) return;   // embedding 不可用:向量条目不触发(静默降级)
   for(const x of vecs){
     const key = x.wbId + ":" + x.entryId;
     if(!x.entry._emb) x.entry._emb = await embedText((x.entry.content || x.entry.comment || "").slice(0,1500));
@@ -2154,20 +2533,22 @@ function v2EntriesIfActive(text){
   if(!V2.curUniverseId || !V2.curUniverse) return null;
   const all = computeActiveEntries();
   const always = all.filter(x => entryMode(x.entry) === "constant")
-                    .map(x => ({ title: entryTitle(x.entry), body: entryBody(x.entry), wbName: x.wbName, wbId: x.wbId, entryId: x.entryId }));
+                    .map(x => ({ title: entryTitle(x.entry), body: entryBody(x.entry), wbName: x.wbName, wbId: x.wbId, entryId: x.entryId,
+                      order: Number(x.entry.order ?? 100) }));
   const optional = all.filter(x => entryMode(x.entry) !== "constant");
   const matched = optional.filter(x => entryMatches(x.entry, text||"", x.wbId + ":" + x.entryId))
                     .map(x => ({ title: entryTitle(x.entry), body: entryBody(x.entry), wbName: x.wbName,
                       wbId: x.wbId, entryId: x.entryId,
                       pos: (x.entry.position !== undefined && x.entry.position !== null) ? Number(x.entry.position) : 5,
-                      depth: Number(x.entry.depth) || 0 }));
+                      depth: Number(x.entry.depth) || 0,
+                      order: Number(x.entry.order ?? 100) }));
   return { entries: all, always, optional, matched };
 }
 
 // 三级下钻交互状态
 function sel(){ return V2.selection; }
 
-/* ---------------- 左侧：世界浏览器（宇宙 → 作品 → 章节） ---------------- */
+/* ---------------- 左侧:世界浏览器(宇宙 → 作品 → 章节) ---------------- */
 function renderWorldBrowser(){
   const box = el("v2WorldBrowser");
   if(!box) return;
@@ -2185,7 +2566,7 @@ function renderWorldBrowser(){
     if(uOpen){
       const ws = (V2.works || []).filter(w => (w.universeId||"") === u.id);
       let child = "";
-      if(ws.length === 0) child = `<div class="v2-node chapter" style="opacity:.6">（无作品集）</div>`;
+      if(ws.length === 0) child = `<div class="v2-node chapter" style="opacity:.6">(无作品集)</div>`;
       for(const w of ws){
         if(!matchW(w)) continue;
         const wOpen = V2.openWorks[w.id] || (ws.length === 1 && !q);
@@ -2194,7 +2575,7 @@ function renderWorldBrowser(){
         if(wOpen){
           const chs = (V2.chaptersCache || {})[w.id] || [];
           let c2 = "";
-          if(chs.length === 0) c2 = `<div class="v2-node chapter" style="opacity:.6">（无章节）</div>`;
+          if(chs.length === 0) c2 = `<div class="v2-node chapter" style="opacity:.6">(无章节)</div>`;
           for(const c of chs){
             if(!matchC(c)) continue;
             c2 += nodeHtml("chapter", c.id, "📄", c.title || "未命名", "", false, sel().chapter === c.id);
@@ -2205,7 +2586,7 @@ function renderWorldBrowser(){
       html += `<div class="v2-children">${child}</div>`;
     }
   }
-  if(!html) html = `<div class="v2-empty">无匹配宇宙<br/><button class="mini-btn" id="v2EmptyNewUniverse">＋ 新建宇宙</button></div>`;
+  if(!html) html = `<div class="v2-empty">无匹配宇宙<br/><button class="mini-btn" id="v2EmptyNewUniverse">+ 新建宇宙</button></div>`;
   box.innerHTML = `<div class="v2-tree">${html}</div>`;
   const nb = box.querySelector("#v2EmptyNewUniverse");
   if(nb) nb.onclick = v2NewWorld;
@@ -2238,7 +2619,7 @@ function nodeHtml(type, id, icon, name, count, open, selected){
     ${count?`<span class="vn-count">${esc(String(count))}</span>`:""}
   </div>`;
 }
-/* 页面左栏：WorldBook 编辑（工具栏 + 条目列表 + 放大编辑） */
+/* 页面左栏:WorldBook 编辑(工具栏 + 条目列表 + 放大编辑) */
 /* ============ 世界管理页:WorldBook 编辑(左栏) ============ */
 function renderWorldBookEditor(body){
   if(!body) return;
@@ -2250,14 +2631,15 @@ function renderWorldBookEditor(body){
   }
   const curWb = (V2._curWbId && V2.wbCache[V2._curWbId]) || null;
   let html = "";
-  // —— 世界书操作常驻按钮排（WorldBook▼ 全库） ——
+  // -- 世界书操作常驻按钮排(WorldBook▼ 全库) --
   html += `<div class="v2-wb-toolbar">
-    <select id="v2WbSel" title="选择任意世界书（全库），下方列出其条目">${allWbs.map(w=>`<option value="${esc(w.id)}" ${w.id===V2._curWbId?"selected":""}>${esc(w.name||w.id)}</option>`).join("")||"<option value=''>（无）</option>"}</select>
+    <select id="v2WbSel" title="选择任意世界书(全库),下方列出其条目">${allWbs.map(w=>`<option value="${esc(w.id)}" ${w.id===V2._curWbId?"selected":""}>${esc(w.name||w.id)}</option>`).join("")||"<option value=''>(无)</option>"}</select>
     <button class="mini-btn v2-wb-rename" ${curWb?"":"disabled"} title="重命名当前世界书">改名</button>
     <button class="mini-btn v2-wb-newentry" ${curWb?"":"disabled"} title="在当前世界书新建条目">新建条目</button>
     <button class="mini-btn v2-wb-del" ${curWb?"":"disabled"} title="删除当前世界书(从所有宇宙引用与全局激活中移除,不可恢复)">删除</button>
     <span class="tb-sep">|</span>
     <button class="mini-btn v2-wb-sort" ${curWb?"":"disabled"} title="按当前显示顺序固化条目顺序">使用当前排序</button>
+    <button class="mini-btn v2-wb-fold" ${curWb?"":"disabled"} title="一键全部展开/折叠条目(不影响显示顺序)">全部</button>
     <button class="mini-btn v2-wb-export" ${curWb?"":"disabled"} title="导出当前世界书为 SillyTavern JSON">导出</button>
     <button class="mini-btn v2-wb-import" title="导入 SillyTavern 世界书 JSON 并绑定">导入</button>
     <button class="mini-btn v2-wb-scan" ${curWb?"":"disabled"} title="扫描当前世界书条目(本地哈希规则,无模型):命中违规特征的条目红框⚠️标记">扫描</button>
@@ -2267,12 +2649,12 @@ function renderWorldBookEditor(body){
 
 
 
-  // —— 条目列表（当前选中 WorldBook，任何世界书） ——
+  // -- 条目列表(当前选中 WorldBook,任何世界书) --
   if(curWb){
-    const entries = entriesToArray(curWb.entries);
-    html += `<div class="v2-curwb-entries">${entries.map(([k,e])=>entryCardHtml(curWb.id, k, e)).join("") || `<div class="v2-empty">该世界书无条目</div>`}</div>`;
+    const entries = sortEntriesForDisplay(entriesToArray(curWb.entries));
+    html += `<div class="v2-curwb-entries">${entries.map(([k,e])=>entryCardHtml(curWb.id, k, e, false)).join("") || `<div class="v2-empty">该世界书无条目</div>`}</div>`;
   } else {
-    html += `<div class="v2-empty">（世界书库为空，点「📥 导入」或「新建」）</div>`;
+    html += `<div class="v2-empty">(世界书库为空,点「📥 导入」或「新建」)</div>`;
   }
 
 
@@ -2283,9 +2665,22 @@ function renderWorldBookEditor(body){
   body.querySelectorAll(".v2-wb-rename").forEach(b=>{ b.onclick = ()=> wbRename(); });
   body.querySelectorAll(".v2-wb-newentry").forEach(b=>{ b.onclick = ()=> wbNewEntry(); });
   body.querySelectorAll(".v2-wb-sort").forEach(b=>{ b.onclick = ()=> wbSortCurrent(); });
+  body.querySelectorAll(".v2-wb-fold").forEach(b=>{
+    const sync = ()=>{
+      const rows = body.querySelectorAll(".wi-row");
+      const container = body.querySelector(".v2-curwb-entries");
+      const willCompact = !(container && container.classList.contains("wi-all-compact"));
+      rows.forEach(r=>{ r.classList.toggle("wi-compact", willCompact); });
+      if(container) container.classList.toggle("wi-all-compact", willCompact);
+      b.textContent = willCompact ? "全部展开" : "全部折叠";
+    };
+    b.onclick = sync;
+    const anyCompact = body.querySelector(".wi-row.wi-compact");
+    b.textContent = anyCompact ? "全部展开" : "全部折叠";
+  });
   body.querySelectorAll(".v2-wb-export").forEach(b=>{ b.onclick = ()=> wbExportCurrent(); });
   body.querySelectorAll(".v2-wb-import").forEach(b=>{ b.onclick = ()=>{
-    if(!V2.curUniverse){ v2Toast("先在工作台选择一个宇宙（导入会自动绑定到该宇宙）", "err"); return; }
+    if(!V2.curUniverse){ v2Toast("先在工作台选择一个宇宙(导入会自动绑定到该宇宙)", "err"); return; }
     importWbToUniverse(V2.curUniverse);
   }; });
   body.querySelectorAll(".v2-wb-scan").forEach(b=>{ b.onclick = ()=> wbScanCurrent(); });
@@ -2293,21 +2688,49 @@ function renderWorldBookEditor(body){
   body.querySelectorAll(".v2-wb-del").forEach(b=>{ b.onclick = ()=> wbDeleteCurrent(); });
   body.querySelectorAll(".wi-row").forEach(row=> bindEntryRow(row));
 }
-/* 放大编辑：全屏大编辑框编辑条目内容 */
+/* 放大编辑:全屏大编辑框编辑条目内容 */
 function wbZoomEdit(wbId, eid){
   const wb = V2.wbCache[wbId]; if(!wb){ v2Toast("世界书未加载", "err"); return; }
   const arr = entriesToArray(wb.entries);
   const idx = arr.findIndex(([k,e])=> String(e.uid ?? e.id ?? k) === eid);
   if(idx < 0){ v2Toast("条目不存在", "err"); return; }
   const e = arr[idx][1];
+  const mode = entryMode(e);
+  const logic = Number(e.selectiveLogic) || 0;
+  const pos = Number(e.position) || 0;
+  // 位置选项(ST 六位)
+  const posSel = el("wbZoomPos");
+  if(posSel) posSel.innerHTML = Object.entries(WI_POS_NAMES).map(([v,n])=>`<option value="${v}" ${pos===Number(v)?"selected":""}>${n}</option>`).join("");
+  // 填充全部字段(完整编辑: 无需齿轮)
+  const enEl = el("wbZoomEnable");
+  if(enEl) enEl.checked = !(e.enabled===false || e.disable===true || e.level==="disabled");
   el("wbZoomTitle").value = entryTitle(e);
   el("wbZoomKeys").value = (e.keys||[]).join(", ");
+  const lg = el("wbZoomLogic"); if(lg) lg.value = String(logic);
+  el("wbZoomKeys2").value = (e.keysecondary||[]).join(", ");
   el("wbZoomBody").value = entryBody(e);
+  const md = el("wbZoomMode"); if(md) md.value = mode;
+  const dp = el("wbZoomDepth"); if(dp) dp.value = e.depth ?? 0;
+  const od = el("wbZoomOrder"); if(od) od.value = e.order ?? 100;
+  const sc = el("wbZoomScan"); if(sc) sc.checked = e.scan !== false;
   el("wbZoomSheet").classList.add("open");
   const doSave = async ()=>{
+    const en = enEl ? enEl.checked : true;
+    if(en){ delete e.level; delete e.disable; e.enabled = true; }
+    else { e.level = "disabled"; e.enabled = false; }
     e.comment = el("wbZoomTitle").value; e.title = el("wbZoomTitle").value;
-    e.keys = el("wbZoomKeys").value.split(/[,，]/).map(x=>x.trim()).filter(Boolean);
+    e.keys = el("wbZoomKeys").value.split(/[,,]/).map(x=>x.trim()).filter(Boolean);
+    const lg2 = el("wbZoomLogic"); if(lg2) e.selectiveLogic = Number(lg2.value);
+    e.keysecondary = el("wbZoomKeys2").value.split(/[,,]/).map(x=>x.trim()).filter(Boolean);
     e.content = el("wbZoomBody").value; e.body = el("wbZoomBody").value;
+    const m = md ? md.value : "logic";
+    if(m === "constant"){ e.constant = true; e.selective = false; delete e.vectorized; }
+    else if(m === "vector"){ e.vectorized = true; e.constant = false; e.selective = true; }
+    else { e.constant = false; e.selective = true; delete e.vectorized; }
+    const pv = el("wbZoomPos"); if(pv) e.position = Number(pv.value);
+    const dv = el("wbZoomDepth"); if(dv) e.depth = Number(dv.value) || 0;
+    const ov = el("wbZoomOrder"); if(ov) e.order = Number(ov.value) || 0;
+    const sv = el("wbZoomScan"); if(sv) e.scan = sv.checked;
     if(sgFlagOf(wbId, eid)) sgClearFlag(wbId, eid);
     wb.entries = entriesToDict(arr);
     await saveWorldBook(wb);
@@ -2320,7 +2743,7 @@ function wbZoomEdit(wbId, eid){
   el("wbZoomClose2").onclick = ()=> el("wbZoomSheet").classList.remove("open");
 }
 function renderWorldSettings(){
-  // 页面左栏同步（世界管理页存在时）：WorldBook 编辑不依赖宇宙选中，放在早退之前
+  // 页面左栏同步(世界管理页存在时):WorldBook 编辑不依赖宇宙选中,放在早退之前
   if(el("wmWbBody")) renderWorldBookEditor(el("wmWbBody"));
   const head = el("wsHead");
   const body = el("v2WorldSettingsBody");
@@ -2349,28 +2772,29 @@ function renderWorldSettings(){
     <div class="v2-bind-grid">
       <div class="v2-bind-head">
         <span class="bh-title">绑定设定书</span>
-        <button class="mini-btn v2-bind-add" title="从世界书库选择绑定到本宇宙">＋ 绑定</button>
+        <button class="mini-btn v2-bind-add" title="从世界书库选择绑定到本宇宙">+ 绑定</button>
         <button class="mini-btn v2-bind-import" title="导入 SillyTavern 世界书并绑定">📥 导入</button>
       </div>
       <div class="v2-bind-bubbles">
         ${boundWbs.map(wb=>`<span class="v2-pop-bubble" data-wbid="${esc(wb.id)}">📕 ${esc(wb.name||wb.id)} <span class="x" data-wbid="${esc(wb.id)}">✕</span></span>`).join("") || `<div class="v2-pop-empty">尚未绑定世界书</div>`}
       </div>
       <div class="v2-bind-cands" style="display:none">
-        <div class="v2-pop-cands-title">点击绑定（世界书库 − 已绑定）：</div>
-        <div class="v2-bind-cand-list">加载中…</div>
+        <div class="v2-pop-cands-title">点击绑定(世界书库 - 已绑定):</div>
+        <div class="v2-bind-cand-list">加载中...</div>
       </div>
     </div>
   </div>`;
 
 
 
-  // —— 世界书操作常驻按钮排（WorldBook▼ 全库） ——
+  // -- 世界书操作常驻按钮排(WorldBook▼ 全库) --
   html += `<div class="v2-wb-toolbar">
-    <select id="v2WbSel" title="选择任意世界书（全库），下方列出其条目">${allWbs.map(w=>`<option value="${esc(w.id)}" ${w.id===V2._curWbId?"selected":""}>${esc(w.name||w.id)}</option>`).join("")||"<option value=''>（无）</option>"}</select>
+    <select id="v2WbSel" title="选择任意世界书(全库),下方列出其条目">${allWbs.map(w=>`<option value="${esc(w.id)}" ${w.id===V2._curWbId?"selected":""}>${esc(w.name||w.id)}</option>`).join("")||"<option value=''>(无)</option>"}</select>
     <button class="mini-btn v2-wb-rename" ${curWb?"":"disabled"} title="重命名当前世界书">改名</button>
     <button class="mini-btn v2-wb-newentry" ${curWb?"":"disabled"} title="在当前世界书新建条目">新建条目</button>
     <span class="tb-sep">|</span>
     <button class="mini-btn v2-wb-sort" ${curWb?"":"disabled"} title="按当前显示顺序固化条目顺序">使用当前排序</button>
+    <button class="mini-btn v2-wb-fold" ${curWb?"":"disabled"} title="一键全部展开/折叠条目(不影响显示顺序)">全部</button>
     <button class="mini-btn v2-wb-export" ${curWb?"":"disabled"} title="导出当前世界书为 SillyTavern JSON">导出</button>
     <button class="mini-btn v2-wb-import" title="导入 SillyTavern 世界书 JSON 并绑定">导入</button>
     <button class="mini-btn v2-wb-scan" ${curWb?"":"disabled"} title="扫描当前世界书条目(本地哈希规则,无模型):命中违规特征的条目红框⚠️标记">扫描</button>
@@ -2379,12 +2803,12 @@ function renderWorldSettings(){
 
 
 
-  // —— 条目列表（当前选中 WorldBook，任何世界书） ——
+  // -- 条目列表(当前选中 WorldBook,任何世界书) --
   if(curWb){
-    const entries = entriesToArray(curWb.entries);
-    html += `<div class="v2-curwb-entries">${entries.map(([k,e])=>entryCardHtml(curWb.id, k, e)).join("") || `<div class="v2-empty">该世界书无条目</div>`}</div>`;
+    const entries = sortEntriesForDisplay(entriesToArray(curWb.entries));
+    html += `<div class="v2-curwb-entries">${entries.map(([k,e])=>entryCardHtml(curWb.id, k, e, true)).join("") || `<div class="v2-empty">该世界书无条目</div>`}</div>`;
   } else {
-    html += `<div class="v2-empty">（世界书库为空，点「📥 导入」或「新建」）</div>`;
+    html += `<div class="v2-empty">(世界书库为空,点「📥 导入」或「新建」)</div>`;
   }
 
 
@@ -2404,13 +2828,13 @@ function renderWorldSettings(){
   // 解绑
   body.querySelectorAll(".v2-bind-bubbles .x").forEach(x=>{
     x.onclick = async ()=>{
-      if(!confirm("从该宇宙解除此世界书？")) return;
+      if(!confirm("从该宇宙解除此世界书?")) return;
       uni.worldBookIds = (uni.worldBookIds||[]).filter(i=>i!==x.dataset.wbid);
       await saveUniverse(uni);
       renderWorldSettings();
     };
   });
-  // ＋绑定：展开/收起内联候选区
+  // +绑定:展开/收起内联候选区
   body.querySelectorAll(".v2-bind-add").forEach(b=>{
     b.onclick = async ()=>{
       const cands = body.querySelector(".v2-bind-cands");
@@ -2420,20 +2844,33 @@ function renderWorldSettings(){
       if(show) await renderBindCands(uni, body);
     };
   });
-  // 工具栏：WorldBook▼ 切换
+  // 工具栏:WorldBook▼ 切换
   const wbSel = body.querySelector("#v2WbSel");
   if(wbSel) wbSel.onchange = e=> selectToolbarWb(e.target.value || null);
   body.querySelectorAll(".v2-wb-rename").forEach(b=>{ b.onclick = ()=> wbRename(); });
   body.querySelectorAll(".v2-wb-newentry").forEach(b=>{ b.onclick = ()=> wbNewEntry(); });
   body.querySelectorAll(".v2-wb-sort").forEach(b=>{ b.onclick = ()=> wbSortCurrent(); });
+  body.querySelectorAll(".v2-wb-fold").forEach(b=>{
+    const sync = ()=>{
+      const rows = body.querySelectorAll(".wi-row");
+      const container = body.querySelector(".v2-curwb-entries");
+      const willCompact = !(container && container.classList.contains("wi-all-compact"));
+      rows.forEach(r=>{ r.classList.toggle("wi-compact", willCompact); });
+      if(container) container.classList.toggle("wi-all-compact", willCompact);
+      b.textContent = willCompact ? "全部展开" : "全部折叠";
+    };
+    b.onclick = sync;
+    const anyCompact = body.querySelector(".wi-row.wi-compact");
+    b.textContent = anyCompact ? "全部展开" : "全部折叠";
+  });
   body.querySelectorAll(".v2-wb-export").forEach(b=>{ b.onclick = ()=> wbExportCurrent(); });
   body.querySelectorAll(".v2-bind-import, .v2-wb-import").forEach(b=>{ b.onclick = ()=> importWbToUniverse(uni); });
   body.querySelectorAll(".v2-wb-scan").forEach(b=>{ b.onclick = ()=> wbScanCurrent(); });
   body.querySelectorAll(".v2-wb-new").forEach(b=>{ b.onclick = ()=> wbNewWorldBook(); });
-  // 条目：ST 式行内编辑 + 放大编辑
+  // 条目:ST 式行内编辑 + 放大编辑
   body.querySelectorAll(".wi-row").forEach(row=> bindEntryRow(row));
 }
-/* WorldBook▼ 选中任意世界书（全库）；无缓存详情时先拉取再渲染 */
+/* WorldBook▼ 选中任意世界书(全库);无缓存详情时先拉取再渲染 */
 async function selectToolbarWb(id){
   V2._curWbId = id;
   if(id && !V2.wbCache[id]){
@@ -2441,7 +2878,7 @@ async function selectToolbarWb(id){
   }
   renderWorldSettings();
 }
-/* ST 世界书条目字段兼容：标题=comment(或 title/name/key)，正文=content(或 body) */
+/* ST 世界书条目字段兼容:标题=comment(或 title/name/key),正文=content(或 body) */
 function entryTitle(e){
   e = e || {};
   return e.comment || e.title || e.name || e.key || "未命名";
@@ -2451,7 +2888,15 @@ function entryBody(e){
   return e.content || e.body || "";
 }
 
-function entryCardHtml(wbId, key, e){
+/* 条目列表显示排序:先按插入位置(0-6),同级按 order 降序(列表越靠上越高) */
+function sortEntriesForDisplay(arr){
+  return arr.slice().sort((a,b)=>{
+    const pa = Number(a[1].position)||0, pb = Number(b[1].position)||0;
+    if(pa !== pb) return pa - pb;
+    return Number(b[1].order ?? 100) - Number(a[1].order ?? 100);
+  });
+}
+function entryCardHtml(wbId, key, e, compact){
   const eid = String(e.uid ?? e.id ?? key);
   const disabled = (e.enabled===false || e.disable===true || e.level==="disabled");
   const chDis = V2.curChapter && Array.isArray(V2.curChapter.disabledEntryIds) ? V2.curChapter.disabledEntryIds : [];
@@ -2466,37 +2911,41 @@ function entryCardHtml(wbId, key, e){
   const body = entryBody(e);
   const hasCh = !!V2.curChapter;
   const flag = sgFlagOf(wbId, eid);
+  // 三态视觉(ST): 常驻=蓝, 关键词=绿, 向量=🔗紫
+  const modeCls = mode === "constant" ? "con" : (mode === "vector" ? "vec" : "log");
+  const modeTag = mode === "constant" ? "常驻" : (mode === "vector" ? "🔗向量" : "关键词");
+  const modeTip = mode === "constant" ? "常驻:始终注入(蓝)" : (mode === "vector" ? "向量:语义匹配激活(🔗)" : "关键词:扫描命中激活(绿)");
+  const logicBadge = logic===3?"AND":logic===1?"NAND":logic===2?"NOR":"OR";
   // ST 呈现习惯:条目本身即编辑行(直接改,失焦/防抖保存);高级字段在 ⚙ 展开区
-  return `<div class="wi-row ${off?"wi-off":""}${flag?" wi-sg":""}" data-wbid="${esc(wbId)}" data-eid="${esc(eid)}">
+  return `<div class="wi-row ${off?"wi-off":""}${flag?" wi-sg":""}${compact?" wi-compact":""}" data-wbid="${esc(wbId)}" data-eid="${esc(eid)}">
     ${flag?`<div class="wi-sg-badge" title="安全闸门:命中[${esc(sgCatText(flag.cats))}]。在线模式下等同关闭(优先于常驻/逻辑/向量模式,不修改原设置);本地模式按原设置注入。编辑内容或点✕清除标记后可恢复。">⚠️ ${esc(sgCatText(flag.cats))}<i class="wi-sg-clear" title="清除标记(恢复注入)">✕</i></div>`:""}
     <div class="wi-main">
-      <label class="wi-en" title="启用/停用(条目级)"><input type="checkbox" class="wi-enable" ${!off?"checked":""}>${off?"<i>停</i>":""}</label>
+      <label class="wi-en wi-en-${modeCls}${off?" wi-en-dis":""}" title="激活模式与启用:${modeTip}。点击开关启用/停用">
+        <input type="checkbox" class="wi-enable" ${!off?"checked":""}>
+        <span class="wi-en-tag">${modeTag}</span>
+        ${off?"<i class='wi-en-off'>停</i>":""}
+      </label>
+      <span class="wi-logic-badge" title="主副逻辑:OR=主或副任一, AND=主且副同时, NAND=非全命中, NOR=都不命中">${logicBadge}</span>
       <input class="wi-title" value="${esc(title)}" placeholder="标题" title="标题(comment)" spellcheck="false">
       <input class="wi-keys" value="${esc(keys)}" placeholder="主触发词" title="主触发词,逗号分隔" spellcheck="false">
-      <input class="wi-keys2" value="${esc(keys2)}" placeholder="副触发词" title="副触发词,逗号分隔" spellcheck="false">
-      <select class="wi-logic" title="主+副触发词组合逻辑(四态)">
-        <option value="0" ${logic===0?"selected":""}>任一命中</option>
-        <option value="1" ${logic===1?"selected":""}>非全部(反触发)</option>
-        <option value="2" ${logic===2?"selected":""}>无命中(反触发)</option>
-        <option value="3" ${logic===3?"selected":""}>全部命中</option>
-      </select>
-      <textarea class="wi-body" rows="1" placeholder="注入AI的条目信息…" title="注入内容(可直接编辑,自动保存)">${esc(body)}</textarea>
+      <textarea class="wi-body" rows="1" placeholder="注入AI的条目信息..." title="注入内容(可直接编辑,自动保存)">${esc(body)}</textarea>
       <select class="wi-pos" title="插入位置">
         ${Object.entries(WI_POS_NAMES).map(([v,n])=>`<option value="${v}" ${pos===Number(v)?"selected":""}>${n}</option>`).join("")}
       </select>
+      <input class="wi-order" type="number" min="0" value="${e.order ?? 100}" title="插入顺序:同级(同位置)时越大注入越靠后、影响越大;列表按此降序显示(越靠上越高)。点「使用当前排序」可固化" spellcheck="false">
       ${hasCh?`<button class="wi-ch" title="在本章节屏蔽此条目(章节级,不影响其他章节)">📵</button>`:""}
       <button class="wi-more" title="高级:副触发词/模式/逻辑/深度/扫描">⚙</button>
-      <button class="wi-zoom" title="放大编辑（大编辑框）">⛲</button>
+      <button class="wi-zoom" title="放大编辑(大编辑框)">⛲</button>
       <button class="wi-del" title="删除条目">✕</button>
     </div>
-        <div class="wi-detail">
+        <div class="wi-detail open">
       <label>副触发词 <input class="wi-keys2-d" value="${esc(keys2)}" placeholder="逗号分隔" spellcheck="false"></label>
-      <label>触发逻辑
-        <select class="wi-logic-d">
-          <option value="0" ${logic===0?"selected":""}>任一命中</option>
-          <option value="1" ${logic===1?"selected":""}>非全部(反触发)</option>
-          <option value="2" ${logic===2?"selected":""}>无命中(反触发)</option>
-          <option value="3" ${logic===3?"selected":""}>全部命中</option>
+      <label>主副逻辑(A&amp;B)
+        <select class="wi-logic-d" title="主词A 与 副词B(过滤器) 的组合逻辑">
+          <option value="0" ${logic===0?"selected":""}>任意 OR(主或副任一)</option>
+          <option value="3" ${logic===3?"selected":""}>与所有 AND(主且副同时)</option>
+          <option value="1" ${logic===1?"selected":""}>非所有 NAND(非全命中)</option>
+          <option value="2" ${logic===2?"selected":""}>非任何 NOR(都不命中)</option>
         </select>
       </label>
       <label>模式
@@ -2528,7 +2977,7 @@ function bindEntryRow(row){
   if(en) en.onchange = ()=>{
     if(en.checked){
       delete e.level; delete e.disable; e.enabled = true;
-      // 若该条目被章节级屏蔽(📵)，勾选=用户明确要启用 → 一并解除
+      // 若该条目被章节级屏蔽(📵),勾选=用户明确要启用 → 一并解除
       if(V2.curChapter && Array.isArray(V2.curChapter.disabledEntryIds)){
         const di = V2.curChapter.disabledEntryIds.indexOf(eid);
         if(di >= 0){
@@ -2543,25 +2992,31 @@ function bindEntryRow(row){
   const title = row.querySelector(".wi-title");
   if(title) title.oninput = ()=>{ e.comment = title.value; e.title = title.value; clearFlag(); commit(); };
   const keys = row.querySelector(".wi-keys");
-  if(keys) keys.oninput = ()=>{ e.keys = keys.value.split(/[,，]/).map(s=>s.trim()).filter(Boolean); commit(); };
+  if(keys) keys.oninput = ()=>{ e.keys = keys.value.split(/[,,]/).map(s=>s.trim()).filter(Boolean); commit(); };
   const body = row.querySelector(".wi-body");
   if(body) body.oninput = ()=>{ e.content = body.value; e.body = body.value; clearFlag(); commit(); };
   const pos = row.querySelector(".wi-pos");
   if(pos) pos.onchange = ()=>{ e.position = Number(pos.value); commit(); };
+  const orderIn = row.querySelector(".wi-order");
+  if(orderIn) orderIn.oninput = ()=>{ e.order = Number(orderIn.value) || 0; commit(); };
   const more = row.querySelector(".wi-more");
   const det = row.querySelector(".wi-detail");
   if(more && det) more.onclick = ()=>{
-    det.classList.toggle("open");
+    // 折叠态点 ⚙ = 展开整卡并打开高级区; 展开态 = 切换高级区
+    if(row.classList.contains("wi-compact")){
+      row.classList.remove("wi-compact");
+      if(!det.classList.contains("open")) det.classList.add("open");
+    } else {
+      det.classList.toggle("open");
+    }
     // 展开时同步高级区字段(横屏下行内 keys2/logic 隐藏, 以高级区为准)
     const k2d = det.querySelector(".wi-keys2-d");
     if(k2d) k2d.value = (e.keysecondary||[]).join(", ");
     const ld = det.querySelector(".wi-logic-d");
     if(ld) ld.value = String(Number(e.selectiveLogic) || 0);
   };
-  const keys2 = row.querySelector(".wi-keys2");
-  if(keys2) keys2.oninput = ()=>{ e.keysecondary = keys2.value.split(/[,，]/).map(s=>s.trim()).filter(Boolean); commit(); };
   const keys2d = row.querySelector(".wi-keys2-d");
-  if(keys2d) keys2d.oninput = ()=>{ e.keysecondary = keys2d.value.split(/[,，]/).map(s=>s.trim()).filter(Boolean); commit(); };
+  if(keys2d) keys2d.oninput = ()=>{ e.keysecondary = keys2d.value.split(/[,,]/).map(s=>s.trim()).filter(Boolean); commit(); };
   const logicd = row.querySelector(".wi-logic-d");
   if(logicd) logicd.onchange = ()=>{ e.selectiveLogic = Number(logicd.value); commit(); };
   const modeSel = row.querySelector(".wi-mode");
@@ -2572,8 +3027,6 @@ function bindEntryRow(row){
     else { e.constant = false; e.selective = true; delete e.vectorized; }
     commit();
   };
-  const logicSel = row.querySelector(".wi-logic");
-  if(logicSel) logicSel.onchange = ()=>{ e.selectiveLogic = Number(logicSel.value); commit(); };
   const depth = row.querySelector(".wi-depth");
   if(depth) depth.oninput = ()=>{ e.depth = Number(depth.value) || 0; commit(); };
   const scan = row.querySelector(".wi-scan");
@@ -2610,7 +3063,7 @@ function curToolbarWb(){
   return wb || null;
 }
 
-/* 新建世界书（空库，创建后自动选中；绑定由「＋绑定」方格完成） */
+/* 新建世界书(空库,创建后自动选中;绑定由「+绑定」方格完成) */
 async function wbNewWorldBook(){
   const n = prompt("世界书名称:", "新世界书"); if(!n) return;
   const id = "wb_" + Date.now();
@@ -2619,10 +3072,10 @@ async function wbNewWorldBook(){
   await loadWorldBooks();
   V2._curWbId = id;
   renderWorldSettings();
-  v2Toast("已新建世界书：" + n, "ok");
+  v2Toast("已新建世界书:" + n, "ok");
 }
 
-/* 改名当前世界书（写回 WorldBook 存储） */
+/* 改名当前世界书(写回 WorldBook 存储) */
 /* ============ WorldBook 工具栏操作(wb* 系列) ============ */
 async function wbRename(){
   const wb = curToolbarWb(); if(!wb) return;
@@ -2630,13 +3083,13 @@ async function wbRename(){
   wb.name = n;
   await saveWorldBook(wb);
   renderWorldSettings();
-  v2Toast("已改名：" + n, "ok");
+  v2Toast("已改名:" + n, "ok");
 }
 
 /* 删除当前世界书:删文件 + 全局激活移除 + 所有宇宙引用移除 */
 async function wbDeleteCurrent(){
   const wb = curToolbarWb(); if(!wb) return;
-  if(!confirm(`确定删除世界书「${wb.name||wb.id}」？\n将从所有宇宙引用与全局激活中移除，文件删除不可恢复。`)) return;
+  if(!confirm(`确定删除世界书「${wb.name||wb.id}」?\n将从所有宇宙引用与全局激活中移除,文件删除不可恢复。`)) return;
   await deleteWorldBook(wb.id);
   V2.worldBooks = (V2.worldBooks||[]).filter(w=>w.id!==wb.id);
   V2.globalActiveWB = (V2.globalActiveWB||[]).filter(i=>i!==wb.id);
@@ -2653,10 +3106,10 @@ async function wbDeleteCurrent(){
   }
   renderWorldSettings();
   renderWorldBrowser();
-  v2Toast("已删除：" + (wb.name||wb.id), "ok");
+  v2Toast("已删除:" + (wb.name||wb.id), "ok");
 }
 
-/* 新建条目（ST 规范字段） */
+/* 新建条目(ST 规范字段) */
 async function wbNewEntry(){
   const wb = curToolbarWb(); if(!wb) return;
   const arr = entriesToArray(wb.entries);
@@ -2664,7 +3117,7 @@ async function wbNewEntry(){
   for(const [,e] of arr){ const u = Number(e.uid ?? e.id ?? 0); if(u > maxUid) maxUid = u; }
   const uid = maxUid + 1;
   const key = String(uid);
-  arr.push([key, { uid, key, title: "新条目", comment: "", content: "", constant: false, selective: false, keys: [], keysecondary: [], body: "", position: 4, depth: 4, enabled: true, order: arr.length, displayIndex: arr.length }]);
+  arr.push([key, { uid, key, title: "新条目", comment: "", content: "", constant: false, selective: false, keys: [], keysecondary: [], body: "", position: 4, depth: 4, enabled: true, order: 100, displayIndex: arr.length }]);
   wb.entries = entriesToDict(arr);
   await saveWorldBook(wb);
   const uid2 = sel().universe;
@@ -2672,21 +3125,21 @@ async function wbNewEntry(){
   if(!V2._openWb[uid2]) V2._openWb[uid2] = {};
   V2._openWb[uid2][wb.id] = true;
   renderWorldSettings();
-  v2Toast("已新建条目，展开编辑", "ok");
+  v2Toast("已新建条目,展开编辑", "ok");
 }
 
-/* 使用当前排序：按显示顺序固化 displayIndex/order */
+/* 使用当前排序:按显示顺序固化 displayIndex/order */
 async function wbSortCurrent(){
   const wb = curToolbarWb(); if(!wb) return;
-  const arr = entriesToArray(wb.entries);
-  arr.forEach(([,e], i)=>{ e.displayIndex = i; e.order = i; });
+  const arr = sortEntriesForDisplay(entriesToArray(wb.entries));
+  arr.forEach(([,e], i)=>{ e.displayIndex = i; e.order = arr.length - 1 - i; });
   wb.entries = entriesToDict(arr);
   await saveWorldBook(wb);
   renderWorldSettings();
   v2Toast("已按当前显示顺序固化", "ok");
 }
 
-/* 词库管理：渲染三层哈希库列表 + 启用/停用开关 */
+/* 词库管理:渲染三层哈希库列表 + 启用/停用开关 */
 const RULE_LAYER_NAMES = { official:"官方", community:"社区", user:"用户", root:"根" };
 function renderRuleManager(){
   const box = el("ruleList"); if(!box) return;
@@ -2700,7 +3153,7 @@ function renderRuleManager(){
       <span class="rule-words">${r.words} 词</span>
       <label class="rule-switch"><input type="checkbox" class="rule-toggle" ${r.enabled?"checked":""}> ${off?"关":"开"}</label>
     </div>`;
-  }).join("") || `<div class="v2-empty">（暂无词库，可在下方转化生成）</div>`;
+  }).join("") || `<div class="v2-empty">(暂无词库,可在下方转化生成)</div>`;
   box.innerHTML = rows;
   box.querySelectorAll(".rule-toggle").forEach(t=>{
     t.onchange = async ()=>{
@@ -2709,50 +3162,50 @@ function renderRuleManager(){
       if(t.checked) dis = dis.filter(p=>p!==path);
       else if(!dis.includes(path)) dis.push(path);
       SG.ruleDisabled = dis;
-      await saveSafeGate();          // 服务端落盘 + 重载规则（立即生效）
+      await saveSafeGate();          // 服务端落盘 + 重载规则(立即生效)
       await loadSafeGate();
       renderRuleManager();
-      v2Toast(t.checked ? "已启用词库：" + path : "已停用词库：" + path, t.checked ? "ok" : "err");
+      v2Toast(t.checked ? "已启用词库:" + path : "已停用词库:" + path, t.checked ? "ok" : "err");
     };
   });
 }
-/* 转化入口：明文词表 → 哈希集（POST /api/safegate/build，明文不落盘，写入 rules/user/） */
+/* 转化入口:明文词表 → 哈希集(POST /api/safegate/build,明文不落盘,写入 rules/user/) */
 async function buildUserRule(){
   const cat = el("ruleCat").value.trim();
   const label = el("ruleLabel").value.trim();
   const words = el("ruleWords").value;
-  if(!cat){ v2Toast("请填写类别标识 cat（字母/数字/_）", "err"); return; }
-  if(!words.trim()){ v2Toast("请粘贴词表（每行一个词）", "err"); return; }
+  if(!cat){ v2Toast("请填写类别标识 cat(字母/数字/_)", "err"); return; }
+  if(!words.trim()){ v2Toast("请粘贴词表(每行一个词)", "err"); return; }
   const btn = el("ruleBuild"); if(btn) btn.disabled = true;
   try{
     const r = await apiV2("POST", "/api/safegate/build", { cat, label, words });
-    if(r && r.error){ v2Toast("转化失败：" + r.error, "err"); }
+    if(r && r.error){ v2Toast("转化失败:" + r.error, "err"); }
     else{
       await loadSafeGate(); renderRuleManager();
-      v2Toast("✅ 已转化 " + (r?r.added:0) + " 个新词（库内共 " + (r?r.words:0) + " 词），已写入并启用：" + cat, "ok");
+      v2Toast("✅ 已转化 " + (r?r.added:0) + " 个新词(库内共 " + (r?r.words:0) + " 词),已写入并启用:" + cat, "ok");
       el("ruleWords").value = "";
     }
-  }catch(e){ v2Toast("转化失败：" + (e && e.message), "err"); }
+  }catch(e){ v2Toast("转化失败:" + (e && e.message), "err"); }
   if(btn) btn.disabled = false;
 }
 
-/* ================ 正文安全闸门（生成时检测） ================
- * 仅「在线模式 + 过滤开启」时生效：点击续写/重做时检查正文，命中违规特征 → 阻止发送 + 提示条。
- * 不做实时检测/标红/透明覆盖层（overlay 方案已弃用：复杂度高、易错位、维护成本大）。
- * 命中区间为原文坐标，哈希词明文不暴露；审查服务不可用时 fail-open。
+/* ================ 正文安全闸门(生成时检测) ================
+ * 仅「在线模式 + 过滤开启」时生效:点击续写/重做时检查正文,命中违规特征 → 阻止发送 + 提示条。
+ * 不做实时检测/标红/透明覆盖层(overlay 方案已弃用:复杂度高、易错位、维护成本大)。
+ * 命中区间为原文坐标,哈希词明文不暴露;审查服务不可用时 fail-open。
  */
 const GATE_ACTIVE = () => state.cfg.backend === "online" && state.cfg.safeGate !== false;
 async function sgCheckPositions(text){
   try{
     const r = await apiV2("POST", "/api/moderate", { text: String(text||"").slice(0, 20000), positions: true });
     return r || { violation:false, hits:[] };
-  }catch(e){ return { violation:false, hits:[] }; }   // 审查服务不可用 → 放行（fail-open）
+  }catch(e){ return { violation:false, hits:[] }; }   // 审查服务不可用 → 放行(fail-open)
 }
 function showGateHint(hits){
   const hint = el("gateHint");
   if(!hint) return;
   const cats = [...new Set(hits.map(h=>h.label||h.cat||"违规"))].join("/");
-  hint.textContent = "⚠️ 正文含 " + hits.length + " 处[" + cats + "]特征，已阻止发送。修改正文后重试；或切换本地模型续写";
+  hint.textContent = "⚠️ 正文含 " + hits.length + " 处[" + cats + "]特征,已阻止发送。修改正文后重试;或切换本地模型续写";
   hint.style.display = "";
 }
 function hideGateHint(){
@@ -2760,15 +3213,15 @@ function hideGateHint(){
   if(hint) hint.style.display = "none";
 }
 
-/* ================ 文本自动脱敏（safeAuto 开关） ================
- * 开（默认）：在线模式发送时，把上下文里的敏感词映射为安全词后发出 —— 发送的是真正脱敏的文本（无规避），
- *            正文/历史原文不动，AI 返回原样追加（无还原）= 纯出站单向过滤，非越狱定义。
- * 关：回到"检测+阻止"模式（正文命中即拦截并提示）。
- * 本地模式不映射不检测。开关持久化于 state.cfg.safeAuto（LS_CONFIG）。
+/* ================ 文本自动脱敏(safeAuto 开关) ================
+ * 开(默认):在线模式发送时,把上下文里的敏感词映射为安全词后发出 -- 发送的是真正脱敏的文本(无规避),
+ *            正文/历史原文不动,AI 返回原样追加(无还原)= 纯出站单向过滤,非越狱定义。
+ * 关:回到"检测+阻止"模式(正文命中即拦截并提示)。
+ * 本地模式不映射不检测。开关持久化于 state.cfg.safeAuto(LS_CONFIG)。
  */
 const SG_SANITIZE_MAP = { gamble:"娱乐", fraud:"推销", drug:"药物", weapon:"器械", terror:"事件", porn:"低俗内容", selfharm:"行为", minor:"违禁内容", reactionary:"言论" };
-/* 词级覆盖：常见敏感词 → 语义合理的替代（优先于类别默认词）。
- * 替代词全部经 /api/moderate 实测零命中（未命中任何词库），可安全发送。 */
+/* 词级覆盖:常见敏感词 → 语义合理的替代(优先于类别默认词)。
+ * 替代词全部经 /api/moderate 实测零命中(未命中任何词库),可安全发送。 */
 const SG_SANITIZE_OVERRIDE = {
   // minor 未成年相关
   "幼女":"未成年少女", "萝莉":"未成年少女", "恋童":"特殊癖好", "炼铜":"特殊癖好",
@@ -2781,7 +3234,7 @@ const SG_SANITIZE_OVERRIDE = {
   // porn 常见单/双字
   "色情":"低俗内容", "淫秽":"低俗内容", "淫荡":"低俗内容", "露骨":"直白", "情色":"暧昧"
 };
-/* 脱敏替换核心：hits 区间从后往前替换（词级覆盖优先，类别默认兜底） */
+/* 脱敏替换核心:hits 区间从后往前替换(词级覆盖优先,类别默认兜底) */
 function sanitizeText(text, hits){
   let out = text;
   for(const h of [...hits].sort((a,b)=> b.s - a.s)){
@@ -2793,10 +3246,10 @@ function sanitizeText(text, hits){
   }
   return out;
 }
-/* 脱敏开关（safeAuto，默认开）：
- * 开 = 在线模式发送时自动映射敏感词为安全词（正文不动，返回不还原）；
- * 关 = 回到"检测+阻止"模式（正文命中即拦截）。
- * 本地模式不映射不检测（技术中性声明）。
+/* 脱敏开关(safeAuto,默认开):
+ * 开 = 在线模式发送时自动映射敏感词为安全词(正文不动,返回不还原);
+ * 关 = 回到"检测+阻止"模式(正文命中即拦截)。
+ * 本地模式不映射不检测(技术中性声明)。
  */
 function renderSanitizeBtn(){
   const btn = el("safeBtn");
@@ -2806,33 +3259,47 @@ function renderSanitizeBtn(){
   btn.disabled = false;
   if(on){
     btn.classList.add("on");
-    btn.title = "自动脱敏已开启：在线模式发送时敏感词自动替换为安全表述（正文不动）。点击关闭 → 检测+阻止";
+    btn.title = "自动脱敏已开启:在线模式发送时敏感词自动替换为安全表述(正文不动)。点击关闭 → 检测+阻止";
   } else {
     btn.classList.remove("on");
-    btn.title = "自动脱敏已关闭：正文含敏感词时阻止发送。点击开启";
+    btn.title = "自动脱敏已关闭:正文含敏感词时阻止发送。点击开启";
+  }
+  // 任务2.2:弹层里的镜像条目(窄屏唯一入口)同步文案与状态
+  const m = el("safeBtnM");
+  if(m){
+    const lab = m.querySelector ? m.querySelector(".m-text") : null;
+    if(lab) lab.textContent = on ? "自动脱敏 · 已开启" : "自动脱敏 · 已关闭";
+    m.classList.add("on");
+    if(!on) m.classList.remove("on");
+  }
+  // ▼ 按钮用颜色表达脱敏状态:绿=已开启(激活) / 红=已关闭(260916b 修订)
+  const mb = el("mobMoreBtn");
+  if(mb){
+    mb.style.color = on ? "#6ee7b7" : "#f87171";
+    mb.title = "更多（查看请求 / 自动脱敏）· 自动脱敏" + (on ? "已开启" : "已关闭");
   }
 }
 function toggleSafeAuto(){
   state.cfg.safeAuto = (state.cfg.safeAuto === false) ? true : false;
   saveCfg();
   renderSanitizeBtn();
-  v2Toast(state.cfg.safeAuto !== false ? "自动脱敏已开启（仅在线模式生效，正文不会被改动）" : "自动脱敏已关闭：改为检测+阻止模式", state.cfg.safeAuto !== false ? "ok" : "err");
+  v2Toast(state.cfg.safeAuto !== false ? "自动脱敏已开启(仅在线模式生效,正文不会被改动)" : "自动脱敏已关闭:改为检测+阻止模式", state.cfg.safeAuto !== false ? "ok" : "err");
 }
 
-/* 扫描当前世界书全部条目：命中违规特征 → 持久化标记（红框⚠️，纯本地哈希规则，无模型） */
+/* 扫描当前世界书全部条目:命中违规特征 → 持久化标记(红框⚠️,纯本地哈希规则,无模型) */
 async function wbScanCurrent(){
   const wb = curToolbarWb(); if(!wb) return;
   const arr = entriesToArray(wb.entries);
   if(!arr.length){ v2Toast("该世界书无条目", "ok"); return; }
-  v2Toast("正在扫描 " + arr.length + " 条…", "ok");
+  v2Toast("正在扫描 " + arr.length + " 条...", "ok");
   const items = arr.map(([k,e])=>({ wbId: wb.id, entryId: String(e.uid ?? e.id ?? k), title: entryTitle(e) || "(未命名)", body: entryBody(e), wbName: wb.name || wb.id }));
   const res = await sgFilterEntries(items);
   await saveSafeGate();
   renderWorldSettings();
   if(res.blocked.length){
-    v2Toast("⚠️ 扫描完成：命中 " + res.blocked.length + " 条 — " + res.blocked.map(b=>b.title).join("、").slice(0, 80), "err");
+    v2Toast("⚠️ 扫描完成:命中 " + res.blocked.length + " 条 - " + res.blocked.map(b=>b.title).join("、").slice(0, 80), "err");
   } else {
-    v2Toast("扫描完成：未发现违规特征", "ok");
+    v2Toast("扫描完成:未发现违规特征", "ok");
   }
 }
 
@@ -2845,12 +3312,12 @@ function wbExportCurrent(){
   a.download = (wb.name || wb.id) + ".json";
   a.click();
   setTimeout(()=>URL.revokeObjectURL(a.href), 2000);
-  v2Toast("已导出：" + (wb.name||wb.id), "ok");
+  v2Toast("已导出:" + (wb.name||wb.id), "ok");
 }
 
 /* 保存编辑表单 */
 async function entryEditDelete(wbid, eid){
-  if(!confirm("删除该条目？")) return;
+  if(!confirm("删除该条目?")) return;
   const wb = V2.wbCache[wbid]; if(!wb) return;
   const arr = entriesToArray(wb.entries).filter(([k,e])=> String(e.uid ?? e.id ?? k) !== eid);
   wb.entries = entriesToDict(arr);
@@ -2874,14 +3341,14 @@ function importWbToUniverse(uni){
         await loadWorldBooks();
         V2._curWbId = wb.id;
         renderWorldSettings(); renderWorldBrowser();
-        v2Toast("已导入并绑定：" + (wb.name||wb.id), "ok");
+        v2Toast("已导入并绑定:" + (wb.name||wb.id), "ok");
       }catch(err){ alert("导入失败:" + err.message); }
     };
     rd.readAsText(fl);
   };
   inp.click();
 }
-/* 内联候选：绑定设定书（世界书库 − 已绑定，点击即绑定，不用浏览器输序号） */
+/* 内联候选:绑定设定书(世界书库 - 已绑定,点击即绑定,不用浏览器输序号) */
 async function renderBindCands(uni, body){
   const list = body.querySelector(".v2-bind-cand-list");
   if(!list) return;
@@ -2889,10 +3356,10 @@ async function renderBindCands(uni, body){
   const bound = uni.worldBookIds || [];
   const cands = V2.worldBooks.filter(w=>!bound.includes(w.id));
   if(!cands.length){
-    list.innerHTML = `<div class="v2-pop-empty">世界书库已全部绑定或为空（可先 📥 导入）</div>`;
+    list.innerHTML = `<div class="v2-pop-empty">世界书库已全部绑定或为空(可先 📥 导入)</div>`;
     return;
   }
-  list.innerHTML = cands.map(w=>`<span class="v2-pop-bubble v2-bind-cand" data-wbid="${esc(w.id)}">＋ 📕 ${esc(w.name)}</span>`).join("");
+  list.innerHTML = cands.map(w=>`<span class="v2-pop-bubble v2-bind-cand" data-wbid="${esc(w.id)}">+ 📕 ${esc(w.name)}</span>`).join("");
   list.querySelectorAll(".v2-bind-cand").forEach(c=>{
     c.onclick = async ()=>{
       const id = c.dataset.wbid;
@@ -2900,12 +3367,12 @@ async function renderBindCands(uni, body){
       await saveUniverse(uni);
       renderWorldSettings();
       const wb = V2.wbCache[id];
-      v2Toast("已绑定：" + ((wb && wb.name) || id), "ok");
+      v2Toast("已绑定:" + ((wb && wb.name) || id), "ok");
     };
   });
 }
 
-/* 条目卡片（新布局，S6 补完整编辑）：标题/主触发词/触发逻辑(预留)/副触发词/注入信息/插入位置(预留)/插入深度 */
+/* 条目卡片(新布局,S6 补完整编辑):标题/主触发词/触发逻辑(预留)/副触发词/注入信息/插入位置(预留)/插入深度 */
 /* 记录导航状态(页面/宇宙/作品/章节),刷新后恢复 */
 function saveLastNav(){
   const act = document.querySelector(".page-nav-btn.active");
@@ -2925,7 +3392,7 @@ async function onSelectUniverse(id){
 async function onSelectWork(id){
   V2.selection.work = id;
   await loadWork(id);
-  // 与作品集联动：自动切换其所属宇宙的宇宙信息
+  // 与作品集联动:自动切换其所属宇宙的宇宙信息
   if(V2.curWork && V2.curWork.universeId && V2.selection.universe !== V2.curWork.universeId){
     V2.selection.universe = V2.curWork.universeId;
     await loadUniverse(V2.curWork.universeId);
@@ -2935,7 +3402,7 @@ async function onSelectWork(id){
   renderWorldSettings();
   renderV2WorkBar();
   renderV2ChapterBar();
-  renderWorldBrowser();  // 切换作品集后立即刷新左侧树，避免显示上一作品集的目录
+  renderWorldBrowser();  // 切换作品集后立即刷新左侧树,避免显示上一作品集的目录
   saveLastNav();
 }
 async function onSelectChapter(id){
@@ -2977,13 +3444,52 @@ function updateGuide(){
   if(b2){ b2.disabled = !unis.length; b2.onclick = ()=> v2NewProject().then(()=>updateGuide()); }
   if(b3){ b3.disabled = !works.length; b3.onclick = ()=> v2NewChapter().then(()=>updateGuide()); }
 }
+/* ---------------- 竖屏章节弹层(任务书 260916b 任务3) ----------------
+ * 窄屏原来的原生 <select> 改为按钮:点开「章节列表 + 新建」,创建按钮直接新建「第 N 章」
+ * (N = 已有最大序号+1,由 nextChapterTitle 计算;名字可在标题行直接改)。
+ * 宽屏仍是原来的 <select>,逻辑不变(保持横竖屏一致处复用横屏实现)。
+ */
+function mobChapterSheetOpen(){ const s = el("mobChapterSheet"); return !!(s && s.classList.contains("open")); }
+function renderMobChapterList(){
+  const box = el("mobChapterList");
+  if(!box) return;
+  const chs = (sel().work && V2.workChapters) ? V2.workChapters : [];
+  if(!chs.length){ box.innerHTML = '<div class="hint">还没有章节，点下方「＋ 新建章节」创建</div>'; return; }
+  box.innerHTML = "";
+  chs.slice().reverse().forEach(c=>{                      // 新的在上
+    const b = document.createElement("button");
+    b.className = "mob-chap-item" + (c.id === sel().chapter ? " on" : "");
+    b.textContent = c.title || "未命名章节";
+    b.onclick = async ()=>{ closeMobChapterSheet(); await onV2ChapterChange(c.id); };
+    box.appendChild(b);
+  });
+  const cur = box.querySelector(".mob-chap-item.on");
+  if(cur && typeof cur.scrollIntoView === "function"){ try{ cur.scrollIntoView({block:"center"}); }catch(e){} }
+}
+function openMobChapterSheet(){
+  const s = el("mobChapterSheet");
+  if(!s) return;
+  renderMobChapterList();
+  s.classList.add("open");
+}
+function closeMobChapterSheet(){ const s = el("mobChapterSheet"); if(s) s.classList.remove("open"); }
 function renderV2ChapterBar(){
   const box = el("v2ChapterBar"); if(!box) return;
   const chs = (sel().work && V2.workChapters) ? V2.workChapters : [];
   const opts = chs.map(c=>`<option value="${esc(c.id)}" ${c.id===sel().chapter?"selected":""}>${esc(c.title||"未命名章节")}</option>`).join("") || "<option value=''>无章节</option>";
   box.innerHTML = opts;
   const mob = el("mobChapterBar");
-  if(mob) mob.innerHTML = opts;   // 移动端标题行章节下拉同步
+  if(mob){
+    if(mob.tagName === "SELECT"){
+      mob.innerHTML = opts;   // 宽屏:仍是原生下拉
+    } else {
+      // 窄屏:按钮只显示当前章节名(任务3)
+      const cur = chs.find(c=> c.id === sel().chapter);
+      mob.textContent = cur ? (cur.title || "未命名章节") : "选择章节";
+      mob.title = chs.length ? ("章节列表(" + chs.length + " 章) · 点开可新建") : "点开新建章节";
+      if(mobChapterSheetOpen()) renderMobChapterList();   // 弹层开着时同步刷新
+    }
+  }
   const ren = el("v2RenameChapter");
   if(ren) ren.disabled = !(sel().work && sel().chapter);
   updateGuide();   // 新用户引导:章节状态变化时刷新遮挡/引导卡
@@ -2991,7 +3497,7 @@ function renderV2ChapterBar(){
 async function onV2UniverseChange(id){ if(id){ V2.openUniverses[id]=true; await onSelectUniverse(id); renderWorldBrowser(); } }
 async function onV2WorkChange(id){ if(id){ V2.openWorks[id]=true; await onSelectWork(id); renderWorldBrowser(); } }
 async function onV2ChapterChange(id){ if(id){ await onSelectChapter(id); renderWorldBrowser(); } }
-// 章节条目 killSwitch（写入章节 disabledEntryIds，存于章节文件）
+// 章节条目 killSwitch(写入章节 disabledEntryIds,存于章节文件)
 async function toggleV2Entry(wbid, eid){
   if(!V2.curChapter){ v2Toast("先选择章节", "err"); return; }
   const dis = V2.curChapter.disabledEntryIds = (V2.curChapter.disabledEntryIds || []);
@@ -3006,11 +3512,11 @@ function v2Toast(text, cls){
   if(s){ setSyncStatus(text, cls || "ok"); setTimeout(()=>{ if(s.textContent===text) setSyncStatus(""); }, 2600); }
 }
 async function v2NewWorld(){
-  const name = prompt("新宇宙名称（如：缘梦宇宙）:", "新宇宙"); if(!name) return;
+  const name = prompt("新宇宙名称(如:缘梦宇宙):", "新宇宙"); if(!name) return;
   const u = await saveUniverse({ id: "u_" + Date.now(), name, worldBookIds: [] });
   await loadUniverses(); V2.openUniverses[u.id]=true;
   await onSelectUniverse(u.id); renderWorldBrowser(); renderV2UniverseBar();
-  v2Toast("已新建宇宙：" + u.name, "ok");
+  v2Toast("已新建宇宙:" + u.name, "ok");
 }
 async function v2NewProject(){
   if(!sel().universe){ alert("先在左侧选择一个宇宙"); return; }
@@ -3018,14 +3524,19 @@ async function v2NewProject(){
   const w = await saveWork({ id: "w_" + Date.now(), name, universeId: sel().universe, chapterIds: [] });
   await loadWorks(); V2.openWorks[w.id]=true;
   await onSelectWork(w.id); renderWorldBrowser(); renderV2WorkBar();
-  v2Toast("已新建作品集：" + w.name, "ok");
+  v2Toast("已新建作品集:" + w.name, "ok");
 }
-/* 新建章节默认标题：按现有章节的序号格式推断下一个（第N章 / 纯数字 / Chapter N），
- * 识别不出回退「第 1 章」。只预填 prompt，用户仍可编辑。 */
+/* 新建章节默认标题:按现有章节的序号格式推断下一个(第N章 / 纯数字 / Chapter N),
+ * 识别不出回退「第 1 章」。只预填 prompt,用户仍可编辑。 */
 function nextChapterTitle(pid){
-  let chs = [];
-  if(pid && V2.curWork === pid) chs = V2.workChapters || [];
-  else if(!pid) chs = V2.workChapters || [];
+  // 20260916 修 BUG:原判断 `V2.curWork === pid` 恒为 false
+  //(V2.curWork 是作品对象、pid 是 id 字符串)→ chs 永远是空数组 → 新建章节恒叫「第 1 章」。
+  // 改为:同一作品取当前章节列表,其它作品取 chaptersCache(loadWork 已按 workId 缓存)。
+  const key = String(pid || V2.curWorkId || (V2.curWork && V2.curWork.id) || "");
+  let chs;
+  if(key && key === String(V2.curWorkId || "")) chs = V2.workChapters || [];
+  else chs = (V2.chaptersCache && V2.chaptersCache[key]) || V2.workChapters || [];
+  if(!Array.isArray(chs)) chs = [];
   let maxN = 0, kind = null;
   for(const ch of chs){
     const t = String((ch && ch.title) || "").trim();
@@ -3039,17 +3550,18 @@ function nextChapterTitle(pid){
   if(kind === "cn") return "第 " + (maxN + 1) + " 章";
   if(kind === "n") return String(maxN + 1);
   if(kind === "ch") return "Chapter " + (maxN + 1);
-  return "第 1 章";
+  // 无可识别序号(自由命名/首个章节):按「已有章节数」续编,不再恒回「第 1 章」造成一堆同名
+  return "第 " + (chs.length + 1) + " 章";
 }
 async function v2NewChapter(){
   if(!sel().work){ alert("先在左侧选择一个作品集"); return; }
-  const title = nextChapterTitle(sel().work);   // 免弹窗：自动续号命名，想改名用 ✎ 按钮
+  const title = nextChapterTitle(sel().work);   // 免弹窗:自动续号命名,想改名用 ✎ 按钮
   const cid = "ch_" + Date.now();
   const ch = { id: cid, title, tags: [], body: "", disabledEntryIds: [] };
   await saveChapter(sel().work, cid, ch);
   await loadWork(sel().work);
   await onSelectChapter(cid); renderWorldBrowser(); renderV2ChapterBar();
-  v2Toast("已新建章节：" + title, "ok");
+  v2Toast("已新建章节:" + title, "ok");
 }
 /* ============ 全局激活(🌐) ============ */
 function toggleV2Global(){
@@ -3085,15 +3597,15 @@ function renderV2GlobalSheet(){
   renderGlobalCands();
 }
 
-/* 候选列表（点击灰框空白处展开）：世界书库 - 已激活 */async function renderGlobalCands(){
+/* 候选列表(点击灰框空白处展开):世界书库 - 已激活 */async function renderGlobalCands(){
   const box = el("v2GlobalCands"); if(!box) return;
   await loadWorldBooks();
   const act = V2.globalActiveWB || [];
   const cands = V2.worldBooks.filter(w=>!act.includes(w.id));
   if(!cands.length){
-    box.innerHTML = `<div class="v2-pop-cands-title">（世界书库已全部激活或为空，可先在宇宙信息中导入）</div>`;
+    box.innerHTML = `<div class="v2-pop-cands-title">(世界书库已全部激活或为空,可先在宇宙信息中导入)</div>`;
   } else {
-    box.innerHTML = `<div class="v2-pop-cands-title">点击启用（加入全局激活）：</div>`
+    box.innerHTML = `<div class="v2-pop-cands-title">点击启用(加入全局激活):</div>`
       + cands.map(w=>`<div class="v2-pop-cand" data-wbid="${esc(w.id)}">📕 ${esc(w.name)}<span class="cnt">${w.entryCount||0} 条</span></div>`).join("");
     box.querySelectorAll(".v2-pop-cand").forEach(c=>{
       c.onclick = async ()=>{
@@ -3108,17 +3620,17 @@ function renderV2GlobalSheet(){
   }
 }
 
-/* 点击全局气泡 → 联动宇宙信息：切换到该世界书所属宇宙、展开其行并滚动定位 */
-/* 全局灰框点击气泡 → 与绑定方格一致的联动：WorldBook▼ 自动选中该书并列出条目
- * （编辑直接改 WorldBook 文件，不影响宇宙引用；若面板无宇宙上下文则自动切入该书所属宇宙） */
+/* 点击全局气泡 → 联动宇宙信息:切换到该世界书所属宇宙、展开其行并滚动定位 */
+/* 全局灰框点击气泡 → 与绑定方格一致的联动:WorldBook▼ 自动选中该书并列出条目
+ * (编辑直接改 WorldBook 文件,不影响宇宙引用;若面板无宇宙上下文则自动切入该书所属宇宙) */
 async function linkGlobalToUniverse(wbid){
   V2._curWbId = wbid;
   if(!V2.wbCache[wbid]){ try{ await loadWorldBook(wbid); }catch(e){} }
   if(window.matchMedia("(max-width:900px)").matches){
-    // 窄屏：转跳到世界管理 → WorldBook 编辑
+    // 窄屏:转跳到世界管理 → WorldBook 编辑
     gotoWbEditor(wbid);
   } else {
-    // 宽屏：展开右侧 WorldBook 快捷编辑（不切换当前宇宙选中；未选宇宙时才定位到气泡所属宇宙）
+    // 宽屏:展开右侧 WorldBook 快捷编辑(不切换当前宇宙选中;未选宇宙时才定位到气泡所属宇宙)
     if(!sel().universe){
       await loadUniverses();
       const uni = V2.universes.find(u=>(u.worldBookIds||[]).includes(wbid));
@@ -3130,13 +3642,13 @@ async function linkGlobalToUniverse(wbid){
     V2.globalSheetOpen = false;
   }
 }
-/* focus: "wb"=WorldBook 编辑栏（左） / "uni"=宇宙管理栏（右）
- * 左上角「世界管理」按钮与右侧「平行世界管理」按钮分工：同一弹层，不同焦点 */
+/* focus: "wb"=WorldBook 编辑栏(左) / "uni"=宇宙管理栏(右)
+ * 左上角「世界管理」按钮与右侧「平行世界管理」按钮分工:同一弹层,不同焦点 */
 async function openWorldManager(){ await loadUniverses(); await loadWorks(); await loadWorldBooks(); renderWorldManager(); renderWorldSettings(); el("worldManagerSheet").classList.add("open"); }
 /* ============ 世界管理页:宇宙管理(右栏) ============ */
 async function renderWorldManager(body){
   const box = body || el("wmBody"); if(!box) return;
-  if(!V2.universes.length){ box.innerHTML = '<div class="v2-empty">还没有宇宙。点上方「＋ 新建宇宙」。</div>'; return; }
+  if(!V2.universes.length){ box.innerHTML = '<div class="v2-empty">还没有宇宙。点上方「+ 新建宇宙」。</div>'; return; }
   let html = "";
   for(const u of V2.universes){
     const ws = (V2.works||[]).filter(w=>(w.universeId||"")===u.id);
@@ -3144,18 +3656,18 @@ async function renderWorldManager(body){
     html += `<div class="wm-world" data-wid="${esc(u.id)}">
       <div class="wm-world-head" data-wid="${esc(u.id)}">
         <span class="wm-name">${esc(u.name||"未命名")}</span>
-        <span class="wm-meta">${ws.length} 作品集 · ${(u.worldBookIds||[]).length} 世界书${wbs.length?("（"+wbs.map(b=>b.name||b.id).join("、")+"）"):""}</span>
+        <span class="wm-meta">${ws.length} 作品集 · ${(u.worldBookIds||[]).length} 世界书${wbs.length?("("+wbs.map(b=>b.name||b.id).join("、")+")"):""}</span>
         <button class="mini-btn wm-rename-world" data-wid="${esc(u.id)}">重命名</button>
         <button class="mini-btn wm-del wm-del-world" data-wid="${esc(u.id)}">删除</button>
       </div>`;
     if(!ws.length){
-      html += `<div class="wm-proj"><span class="wm-pname"><small>暂无作品集</small></span><button class="mini-btn wm-new-proj" data-wid="${esc(u.id)}">＋ 新建作品集</button></div>`;
+      html += `<div class="wm-proj"><span class="wm-pname"><small>暂无作品集</small></span><button class="mini-btn wm-new-proj" data-wid="${esc(u.id)}">+ 新建作品集</button></div>`;
     }
     for(const w of ws){
       const chs = (V2.curWorkId === w.id) ? (V2.workChapters||[]) : [];
       html += `<div class="wm-proj" data-pid="${esc(w.id)}">
         <span class="wm-pname">📘 ${esc(w.name||"未命名")} <small>${(w.chapterIds||[]).length} 章</small></span>
-        <button class="mini-btn wm-new-chap" data-pid="${esc(w.id)}">＋ 章</button>
+        <button class="mini-btn wm-new-chap" data-pid="${esc(w.id)}">+ 章</button>
         <button class="mini-btn wm-rename-proj" data-pid="${esc(w.id)}">改名</button>
         <button class="mini-btn wm-del wm-del-proj" data-pid="${esc(w.id)}">删除</button>
       </div>`;
@@ -3183,34 +3695,34 @@ async function renderWorldManager(body){
   box.querySelectorAll(".wm-new-chap").forEach(b=> b.onclick = ()=> wmNewChapter(b.dataset.pid));
   box.querySelectorAll(".wm-del-chap").forEach(b=> b.onclick = ()=> delChapter(b.dataset.pid, b.dataset.cid));
   box.querySelectorAll(".wm-rename-chap").forEach(b=> b.onclick = ()=> renameChapter(b.dataset.pid, b.dataset.cid));
-  // 无参调用（弹层）时，若页面右栏存在则同步刷新，避免“退出重进才更新”
+  // 无参调用(弹层)时,若页面右栏存在则同步刷新,避免"退出重进才更新"
   if(!body && el("wmBodyPage") && el("wmBodyPage") !== box) renderWorldManager(el("wmBodyPage"));
 }
 async function openWorldFromManager(wid){ await onSelectUniverse(wid); renderWorldBrowser(); renderV2UniverseBar(); el("worldManagerSheet").classList.remove("open"); }
 async function wmNewProject(wid){ const name = prompt("新作品集名称:", "新作品集"); if(!name) return; const w = await saveWork({ id:"w_"+Date.now(), name, universeId:wid, chapterIds:[] }); await loadWorks(); V2.openWorks[w.id]=true; await onSelectWork(w.id); renderWorldManager(); }
 async function wmNewChapter(pid){
-  if(V2.curWork !== pid) await loadWork(pid);   // 确保 V2.workChapters 是目标作品的，推断序号准确
-  const title = nextChapterTitle(pid);          // 免弹窗：自动续号命名
+  if(V2.curWork !== pid) await loadWork(pid);   // 确保 V2.workChapters 是目标作品的,推断序号准确
+  const title = nextChapterTitle(pid);          // 免弹窗:自动续号命名
   const cid = "ch_"+Date.now(); const ch = { id:cid, title, tags:[], body:"", disabledEntryIds:[] };
   await saveChapter(pid, cid, ch); await loadWork(pid); renderWorldManager();
 }
 async function renameUniverse(wid){ const u = V2.universes.find(x=>x.id===wid); if(!u) return; const n = prompt("宇宙名称:", u.name); if(!n) return; u.name=n; await saveUniverse(u); await loadUniverses(); renderWorldManager(); renderV2UniverseBar(); }
 async function renameWork(pid){ const w = V2.works.find(x=>x.id===pid); if(!w) return; const n = prompt("作品集名称:", w.name); if(!n) return; w.name=n; await saveWork(w); await loadWorks(); renderWorldManager(); renderV2WorkBar(); }
 async function renameChapter(pid, cid){ const cur = (V2.workChapters||[]).find(x=>x.id===cid); const name = prompt("章节标题:", (cur&&cur.title)||""); if(!name) return; const ch = await apiV2("GET", "/api/works/"+enc(pid)+"/chapters/"+enc(cid)); if(!ch) return; ch.title = name; await saveChapter(pid, cid, ch); await loadWork(pid); renderWorldManager(); renderV2ChapterBar(); }
-async function delUniverse(wid){ if(!confirm("删除宇宙？其下作品集不会被删除，但会失去宇宙绑定。")) return; await deleteUniverse(wid); await loadUniverses(); renderWorldManager(); renderWorldBrowser(); renderV2UniverseBar(); }
-async function delWork(pid){ if(!confirm("删除作品集及其全部章节？")) return; await deleteWork(pid); await loadWorks(); renderWorldManager(); renderWorldBrowser(); renderV2WorkBar(); }
-async function delChapter(pid, cid){ if(!confirm("删除该章节？")) return; await deleteChapter(pid, cid); await loadWork(pid); renderWorldManager(); renderWorldBrowser(); renderV2ChapterBar(); }
+async function delUniverse(wid){ if(!confirm("删除宇宙?其下作品集不会被删除,但会失去宇宙绑定。")) return; await deleteUniverse(wid); await loadUniverses(); renderWorldManager(); renderWorldBrowser(); renderV2UniverseBar(); }
+async function delWork(pid){ if(!confirm("删除作品集及其全部章节?")) return; await deleteWork(pid); await loadWorks(); renderWorldManager(); renderWorldBrowser(); renderV2WorkBar(); }
+async function delChapter(pid, cid){ if(!confirm("删除该章节?")) return; await deleteChapter(pid, cid); await loadWork(pid); renderWorldManager(); renderWorldBrowser(); renderV2ChapterBar(); }
 async function migrateLegacyToV2(force){
-  // v1 迁移已废弃：数据层已重构为 Universes / works / WorldBook，浏览器旧 localStorage 不再合并。
+  // v1 迁移已废弃:数据层已重构为 Universes / works / WorldBook,浏览器旧 localStorage 不再合并。
 }
 async function initV2(){
-  const last = loadJSON(LS_LASTNAV, null) || {};  // 开头读一次：恢复选择与页面恢复共用，避免被 onSelect* 的 saveLastNav 覆盖污染
+  const last = loadJSON(LS_LASTNAV, null) || {};  // 开头读一次:恢复选择与页面恢复共用,避免被 onSelect* 的 saveLastNav 覆盖污染
   try{
     // 并行拉取:宇宙/作品/世界书/全局激活互不依赖
     await Promise.all([ loadUniverses(), loadWorks(), loadWorldBooks(), loadGlobal() ]);
     if(V2.universes.length){
       const first = V2.universes[0].id;
-      // 刷新恢复：优先打开上次宇宙/作品/章节（不存在则回退第一个）
+      // 刷新恢复:优先打开上次宇宙/作品/章节(不存在则回退第一个)
       const uniId = (last.universe && V2.universes.some(u=>u.id===last.universe)) ? last.universe : first;
       V2.openUniverses[uniId] = true;
       await onSelectUniverse(uniId);
@@ -3230,7 +3742,7 @@ async function initV2(){
     renderV2ChapterBar();
     renderProjectTabs();
   }catch(e){ console.warn("v2 init 部分失败(可忽略):", e); }
-  // 刷新恢复：切回上次所在页面（世界管理/提示词工具）——用内存 last，不重读 localStorage（避免读到被覆盖的 workbench）
+  // 刷新恢复:切回上次所在页面(世界管理/提示词工具)--用内存 last,不重读 localStorage(避免读到被覆盖的 workbench)
   if(last.page && last.page !== "workbench"){
     const btn = document.querySelector('.page-nav-btn[data-page="'+last.page+'"]');
     if(btn) btn.click();
@@ -3238,39 +3750,65 @@ async function initV2(){
   document.documentElement.classList.remove("restore-universe", "restore-prompt");  // 首帧类使命完成,移除后手动切页淡入恢复
 }
 
-/* ---------------- 提示词工具 · 风格预设编辑 ---------------- */
-function renderStyleList(){
-  const box = el("styleList"); if(!box) return;
-  const styles = state.styles || [];
-  if(!styles.length){ box.innerHTML = '<div class="v2-empty">还没有风格预设，点「＋ 新建风格」创建。</div>'; return; }
-  box.innerHTML = styles.map(s=>`
-    <div class="style-item" data-sid="${esc(s.id)}">
-      <div class="style-item-head">
-        <span class="style-name">${esc(s.name||s.id)}</span>
-        <span class="style-desc">${esc(s.desc||"")}</span>
-        <span class="style-badge">${s.id===state.style?"✓ 使用中":""}</span>
-        <div class="style-ops">
-          <button class="mini-btn style-pick" data-sid="${esc(s.id)}">使用</button>
-          <button class="mini-btn style-edit-toggle" data-sid="${esc(s.id)}">编辑</button>
-          <button class="mini-btn style-del" data-sid="${esc(s.id)}">删除</button>
-        </div>
-      </div>
+/* ---------------- 提示词工具 · 风格预设(服务端权威 / 浏览器版本 双区) ---------------- */
+function styleItemHtml(s, isLocal){
+  const badge = s.id===state.style ? '<span class="style-badge">✓ 使用中</span>' : '';
+  const ops = isLocal
+    ? `<button class="mini-btn style-pick" data-sid="${esc(s.id)}">使用</button>
+       <button class="mini-btn primary style-submit" data-sid="${esc(s.id)}">提交到服务器</button>
+       <button class="mini-btn danger style-del-local" data-sid="${esc(s.id)}">删除本地</button>`
+    : `<button class="mini-btn style-pick" data-sid="${esc(s.id)}">使用</button>
+       <button class="mini-btn style-edit-toggle" data-sid="${esc(s.id)}">编辑</button>
+       <button class="mini-btn danger style-del" data-sid="${esc(s.id)}">删除</button>`;
+  const editBox = isLocal ? "" : `
       <div class="style-edit" data-sid="${esc(s.id)}" style="display:none">
         <label>名称 <input class="se-name" value="${esc(s.name||"")}"></label>
         <label>描述 <input class="se-desc" value="${esc(s.desc||"")}"></label>
         <label>系统提示词 <textarea class="se-sys" rows="4">${esc(s.sysPrompt||"")}</textarea></label>
         <div class="se-params">
-          ${PARAM_KEYS.concat(["max_tokens"]).map(k=>{
-            const v = (s.params && s.params[k]!==undefined) ? s.params[k] : ((DEFAULT_PARAMS[k]!==undefined?DEFAULT_PARAMS[k]:CONFIG.defaultMaxTokens));
-            return `<label>${k} <input type="number" step="0.01" class="se-p" data-k="${k}" value="${v}"></label>`;
-          }).join("")}
+          <label>强度 <input type="range" min="0" max="1" step="0.05" class="se-s" value="${(s.s!==undefined?Number(s.s):0)}"><output class="se-s-out">${Math.round((Number(s.s)||0)*100)}%</output></label>
+          <div class="se-dir">
+            ${Object.keys(OFFSET_MAX).map(k=>{
+              const d = Number((s.dir||{})[k])||0;
+              return `<label>${k} <select class="se-d" data-k="${k}"><option value="-1"${d<0?" selected":""}>− 更低</option><option value="0"${d===0?" selected":""}>· 不变</option><option value="1"${d>0?" selected":""}>＋ 更高</option></select></label>`;
+            }).join("")}
+          </div>
+          ${isLegacyStyle(s) ? '<div class="se-legacy">旧格式：原有 params 已停用（不再直接覆盖模型参数）。请设好强度与方向后保存。</div>' : ''}
         </div>
         <div class="style-edit-ops">
-          <button class="mini-btn style-save" data-sid="${esc(s.id)}">保存</button>
+          <button class="mini-btn primary style-save" data-sid="${esc(s.id)}">保存</button>
         </div>
-      </div>
-    </div>`).join("");
+      </div>`;
+  return `
+    <div class="style-item${isLocal?" local":""}" data-sid="${esc(s.id)}">
+      <div class="style-item-head">
+        <span class="style-name">${esc(s.name||s.id)}</span>
+        ${isLocal?'<span class="style-badge bp-local">未提交</span>':badge}
+        ${(!isLocal && s.s!==undefined) ? '<span class="style-badge st-s">强度 '+Math.round((Number(s.s)||0)*100)+'%</span>' : ''}
+        ${(!isLocal && isLegacyStyle(s)) ? '<span class="style-badge st-legacy">旧参数已停用</span>' : ''}
+        <div class="style-ops">${ops}</div>
+      </div>${editBox}
+    </div>`;
+}
+function renderStyleList(){
+  const box = el("styleList"); if(!box) return;
+  const styles = state.styles || [];
+  const locals = (state.browserPrefs && state.browserPrefs.styles) || [];
+  let html = styles.map(s=>styleItemHtml(s,false)).join("");
+  html += locals.map(s=>styleItemHtml(s,true)).join("");
+  if(!html) html = '<div class="v2-empty">还没有风格预设，点「＋ 新建风格」创建（新建即写入服务端）。</div>';
+  box.innerHTML = html;
   box.querySelectorAll(".style-pick").forEach(b=> b.onclick = ()=>{ applyStyle(b.dataset.sid, true); populateStyleSel(); renderStyleList(); });
+  box.querySelectorAll(".style-submit").forEach(b=> b.onclick = ()=> submitBrowserItem("styles", b.dataset.sid));
+  box.querySelectorAll(".style-del-local").forEach(b=> b.onclick = ()=>{
+    const sid = b.dataset.sid;
+    if(!confirm("删除本地风格「"+sid+"」?(只删浏览器本地,不影响服务端)")) return;
+    const cur = (loadJSON(LS_STYLES, []) || []).filter(x=> !x || x.id !== sid);
+    try{ localStorage.setItem(LS_STYLES, JSON.stringify(cur)); }catch(e){}
+    if(state.style === sid) applyStyle("custom", true);
+    detectBrowserPrefs(); renderStyleList(); updatePrefsToolbar(); populateStyleSel();
+  });
+  box.querySelectorAll(".se-s").forEach(r=> r.oninput = ()=>{ const o = r.parentElement.querySelector(".se-s-out"); if(o) o.textContent = Math.round((Number(r.value)||0)*100)+"%"; });
   box.querySelectorAll(".style-edit-toggle").forEach(b=> b.onclick = ()=>{
     const ed = box.querySelector(`.style-edit[data-sid="${b.dataset.sid}"]`);
     if(ed) ed.style.display = ed.style.display === "none" ? "block" : "none";
@@ -3282,7 +3820,11 @@ function renderStyleList(){
     preset.name = ((item.querySelector(".se-name")||{}).value || "").trim() || preset.name;
     preset.desc = (item.querySelector(".se-desc")||{}).value || "";
     preset.sysPrompt = (item.querySelector(".se-sys")||{}).value || "";
-    item.querySelectorAll(".se-p").forEach(inp=>{ preset.params = preset.params||{}; preset.params[inp.dataset.k] = Number(inp.value); });
+    const sInp = item.querySelector(".se-s"); if(sInp) preset.s = clampNum(Number(sInp.value)||0, 0, 1);
+    const dirNew = {};
+    item.querySelectorAll(".se-d").forEach(sel=>{ const v = Number(sel.value)||0; if(v) dirNew[sel.dataset.k] = v; });
+    preset.dir = dirNew;
+    delete preset.params;   // 旧格式参数已停用,保存即清除
     saveStyles();
     populateStyleSel();
     if(sid===state.style) applyStyle(sid, false);
@@ -3291,66 +3833,61 @@ function renderStyleList(){
   });
   box.querySelectorAll(".style-del").forEach(b=> b.onclick = ()=>{
     const sid = b.dataset.sid;
-    if(!confirm("删除风格预设「"+sid+"」?")) return;
+    if(!confirm("删除风格预设「"+sid+"」?(服务端也会删除)")) return;
     state.styles = (state.styles||[]).filter(x=>x.id!==sid);
     if(state.style===sid) applyStyle("custom", true);
     saveStyles(); populateStyleSel(); renderStyleList();
   });
 }
-function addStyle(){
-  const name = prompt("新风格预设名称:", "新风格");
+/* 需求6:风格模板化 -- 不再内置预设;点「新建风格」先选模板,选中才写入服务端 */
+function addStyle(){ openStyleTemplates(); }
+function openStyleTemplates(){
+  const box = el("tplList"); if(!box) return;
+  box.innerHTML = (STYLE_TEMPLATES||[]).map(t=>`
+    <div class="tpl-item" data-tplid="${esc(t.id)}">
+      <div class="tpl-name">${esc(t.name)}</div>
+      <div class="tpl-desc">${esc(t.desc||"")}</div>
+    </div>`).join("");
+  box.querySelectorAll(".tpl-item").forEach(d=> d.onclick = ()=> createStyleFromTemplate(d.dataset.tplid));
+  const sheet = el("tplSheet"); if(sheet) sheet.classList.add("open");
+}
+async function createStyleFromTemplate(tplId){
+  const t = (STYLE_TEMPLATES||[]).find(x=>x.id===tplId);
+  if(!t){ v2Toast("模板不存在", "err"); return; }
+  const name = prompt("新风格预设名称:", t.name || "新风格");
   if(!name) return;
-  const id = "st_"+Date.now();
-  (state.styles = state.styles||[]).push({ id, name, desc:"", sysPrompt:"你是一位小说续写助手。只输出续写的正文，不要解释、不要重复前文、不要包裹代码块。\n文风：", params:{...DEFAULT_PARAMS, max_tokens:Number(CONFIG.defaultMaxTokens)} });
-  saveStyles(); populateStyleSel(); renderStyleList();
+  const id = "st_" + Date.now();
+  (state.styles = state.styles||[]).push({
+    id, name, desc: t.desc || "", sysPrompt: t.sysPrompt || "",
+    s: (t.s !== undefined ? Number(t.s) : 0.5),   // 强度(0~1)
+    dir: { ...(t.dir||{}) }                        // 每参数方向(±1/0);绝对值由模型层给
+  });
+  const sheet = el("tplSheet"); if(sheet) sheet.classList.remove("open");
+  renderStyleList(); populateStyleSel();
+  const ok = await pushPrefs(false);      // 需求6:新建的风格默认写入服务端 prefs.json
+  if(ok) v2Toast("已新建风格并写入服务端:"+name, "ok");
 }
-function resetStyles(){
-  if(!confirm("恢复内置风格预设？你编辑过的自定义风格将被覆盖。")) return;
-  state.styles = JSON.parse(JSON.stringify(STYLE_PRESETS));  // 深拷贝,避免后续编辑污染内置常量
-  saveStyles(); populateStyleSel(); renderStyleList();
-}
+
 /* ---------------- 提示词条目(底层:对齐 ST extension_prompt 插入体系) ---------------- */
-function savePromptItems(){ try{ localStorage.setItem(LS_PROMPTITEMS, JSON.stringify(state.promptItems||[])); }catch{} }
+function savePromptItems(){ try{ localStorage.setItem(LS_PROMPTITEMS, JSON.stringify(state.promptItems||[])); }catch{} schedulePrefsPush(); }
+/* [已从 UI 移除·20260916] 提示词条目：注入链路仍然生效（systemPromptParts/chatPromptItems 照旧读 state.promptItems），
+ * 仅预设管理页不再展示入口；恢复方法见 archives/remove_promptitems_20260916/REMOVED.md */
 function renderPromptItems(){
   const box = el("piList"); if(!box) return;
   const items = state.promptItems || [];
-  if(!items.length){ box.innerHTML = '<div class="v2-empty">还没有提示词条目。点「＋ 新建条目」添加（如：世界观总纲·before / 行动准则·in / 场景氛围·in_chat）。</div>'; return; }
-  box.innerHTML = items.map(it=>`
-    <div class="style-item" data-piid="${esc(it.id)}">
-      <div class="style-item-head">
-        <span class="style-name">${esc(it.name||it.id)}</span>
-        <span class="style-desc">位置:${it.position} · 角色:${it.role} ${it.position==="in_chat"?("· 深度:"+(it.depth||0)):""} ${it.enabled===false?"· 已停用":""}</span>
-        <label class="pi-enable"><input type="checkbox" class="pi-on" ${it.enabled===false?"":"checked"}>启用</label>
-        <div class="style-ops">
-          <button class="mini-btn pi-edit-toggle" data-piid="${esc(it.id)}">编辑</button>
-          <button class="mini-btn style-del pi-del" data-piid="${esc(it.id)}">删除</button>
-        </div>
-      </div>
-      <div class="style-edit" data-piid="${esc(it.id)}" style="display:none">
-        <label>名称 <input class="pi-name" value="${esc(it.name||"")}"></label>
-        <label>内容 <textarea class="pi-content" rows="3">${esc(it.content||"")}</textarea></label>
-        <div class="se-params">
-          <label>位置
-            <select class="pi-pos">
-              <option value="before" ${it.position==="before"?"selected":""}>开头（系统区最前）</option>
-              <option value="in" ${it.position==="in"?"selected":""}>设定区（系统区末尾）</option>
-              <option value="in_chat" ${it.position==="in_chat"?"selected":""}>前文内（按深度）</option>
-            </select>
-          </label>
-          <label>角色
-            <select class="pi-role">
-              <option value="system" ${it.role==="system"?"selected":""}>系统</option>
-              <option value="user" ${it.role==="user"?"selected":""}>用户</option>
-              <option value="assistant" ${it.role==="assistant"?"selected":""}>助手</option>
-            </select>
-          </label>
-          <label>深度(仅 in_chat) <input type="number" min="0" class="pi-depth" value="${Number(it.depth)||0}"></label>
-        </div>
-        <div class="style-edit-ops">
-          <button class="mini-btn pi-save" data-piid="${esc(it.id)}">保存</button>
-        </div>
-      </div>
-    </div>`).join("");
+  const locals = (state.browserPrefs && state.browserPrefs.promptItems) || [];
+  let html = items.map(it=>piItemHtml(it,false)).join("");
+  html += locals.map(it=>piItemHtml(it,true)).join("");
+  if(!html) html = '<div class="v2-empty">还没有提示词条目。点「＋ 新建条目」添加（新建即写入服务端）。</div>';
+  box.innerHTML = html;
+  box.querySelectorAll(".pi-submit").forEach(b=> b.onclick = ()=> submitBrowserItem("promptItems", b.dataset.piid));
+  box.querySelectorAll(".pi-del-local").forEach(b=> b.onclick = ()=>{
+    const id = b.dataset.piid;
+    if(!confirm("删除本地提示词条目「"+id+"」?(只删浏览器本地,不影响服务端)")) return;
+    const cur = (loadJSON(LS_PROMPTITEMS, []) || []).filter(x=> !x || x.id !== id);
+    try{ localStorage.setItem(LS_PROMPTITEMS, JSON.stringify(cur)); }catch(e){}
+    detectBrowserPrefs(); renderPromptItems(); updatePrefsToolbar();
+  });
   box.querySelectorAll(".pi-on").forEach(c=> c.onchange = ()=>{
     const it = (state.promptItems||[]).find(x=>x.id===c.closest(".style-item").dataset.piid);
     if(it){ it.enabled = c.checked; savePromptItems(); }
@@ -3373,10 +3910,54 @@ function renderPromptItems(){
   });
   box.querySelectorAll(".pi-del").forEach(b=> b.onclick = ()=>{
     const id = b.dataset.piid;
-    if(!confirm("删除提示词条目「"+id+"」?")) return;
+    if(!confirm("删除提示词条目「"+id+"」?(服务端也会删除)")) return;
     state.promptItems = (state.promptItems||[]).filter(x=>x.id!==id);
     savePromptItems(); renderPromptItems();
   });
+}
+function piItemHtml(it, isLocal){
+  const ops = isLocal
+    ? `<button class="mini-btn primary pi-submit" data-piid="${esc(it.id)}">提交到服务器</button>
+       <button class="mini-btn danger pi-del-local" data-piid="${esc(it.id)}">删除本地</button>`
+    : `<button class="mini-btn pi-edit-toggle" data-piid="${esc(it.id)}">编辑</button>
+       <button class="mini-btn danger pi-del" data-piid="${esc(it.id)}">删除</button>`;
+  const head = `
+      <div class="style-item-head">
+        <span class="style-name">${esc(it.name||it.id)}</span>
+        ${isLocal?'<span class="style-badge bp-local">未提交</span>':`<label class="pi-enable"><input type="checkbox" class="pi-on" ${it.enabled===false?"":"checked"}>启用</label>`}
+        <div class="style-ops">${ops}</div>
+      </div>`;
+  if(isLocal){
+    return `<div class="style-item local" data-piid="${esc(it.id)}">${head}
+      <div class="style-edit" style="display:block"><label>内容 <textarea rows="3" readonly>${esc(it.content||"")}</textarea></label></div>
+    </div>`;
+  }
+  return `<div class="style-item" data-piid="${esc(it.id)}">${head}
+      <div class="style-edit" data-piid="${esc(it.id)}" style="display:none">
+        <label>名称 <input class="pi-name" value="${esc(it.name||"")}"></label>
+        <label>内容 <textarea class="pi-content" rows="3">${esc(it.content||"")}</textarea></label>
+        <div class="se-params">
+          <label>位置
+            <select class="pi-pos">
+              <option value="before" ${it.position==="before"?"selected":""}>开头(系统区最前)</option>
+              <option value="in" ${it.position==="in"?"selected":""}>设定区(系统区末尾)</option>
+              <option value="in_chat" ${it.position==="in_chat"?"selected":""}>前文内(按深度)</option>
+            </select>
+          </label>
+          <label>角色
+            <select class="pi-role">
+              <option value="system" ${it.role==="system"?"selected":""}>系统</option>
+              <option value="user" ${it.role==="user"?"selected":""}>用户</option>
+              <option value="assistant" ${it.role==="assistant"?"selected":""}>助手</option>
+            </select>
+          </label>
+          <label>深度(仅 in_chat) <input type="number" min="0" class="pi-depth" value="${Number(it.depth)||0}"></label>
+        </div>
+        <div class="style-edit-ops">
+          <button class="mini-btn primary pi-save" data-piid="${esc(it.id)}">保存</button>
+        </div>
+      </div>
+    </div>`;
 }
 function addPromptItem(){
   const name = prompt("新提示词条目名称:", "新条目");
@@ -3385,7 +3966,7 @@ function addPromptItem(){
   savePromptItems(); renderPromptItems();
 }
 
-/* ---------------- 页面导航（工作台 / 宇宙管理 / 提示词工具） ---------------- */
+/* ---------------- 页面导航(工作台 / 宇宙管理 / 提示词工具) ---------------- */
 let _savedPreview = null;  // 离开工作台时保存的思考/预览状态
 function bindPageNav(){
   const btns = document.querySelectorAll(".page-nav-btn");
@@ -3396,7 +3977,7 @@ function bindPageNav(){
       btns.forEach(x=>x.classList.toggle("active", x===b));
       updateMobPageTitle();
       saveLastNav();
-      // 世界管理/提示词工具页：自动折叠思考+预览；返回工作台恢复原状
+      // 世界管理/提示词工具页:自动折叠思考+预览;返回工作台恢复原状
       if(page === "workbench"){
         if(_savedPreview){
           if(_savedPreview.think) el("thinkPanel").classList.add("open");
@@ -3430,14 +4011,14 @@ function bindPageNav(){
         if(pp) pp.style.display = "flex";
         renderStyleList();
         renderPromptItems();
-        renderRuleManager();   // 词库管理：进入页面时刷新（外部可能已变化）
+        renderRuleManager();   // 词库管理:进入页面时刷新(外部可能已变化)
       } else {
         if(main) main.style.display = "none";
         if(v2bar) v2bar.style.display = "none";
         if(composer) composer.style.display = "none";
                 if(ph) ph.style.display = "flex";
         if(pp) pp.style.display = "none";
-        // 世界管理页：左 WorldBook 编辑 + 右 宇宙管理（initV2 已预载,直接渲染零等待;数据为空才兜底加载）
+        // 世界管理页:左 WorldBook 编辑 + 右 宇宙管理(initV2 已预载,直接渲染零等待;数据为空才兜底加载)
         if((V2.worldBooks||[]).length) renderWorldBookEditor(el("wmWbBody"));
         else loadWorldBooks().then(()=>{ renderWorldBookEditor(el("wmWbBody")); });
         if((V2.universes||[]).length) renderWorldManager(el("wmBodyPage"));
@@ -3450,17 +4031,26 @@ function bindPageNav(){
   });
 }
 
-/* ---------------- 事件绑定（v2 体系） ---------------- */
+/* ---------------- 事件绑定(v2 体系) ---------------- */
 function bindV2(){
   if(el("v2WorldSearch")) el("v2WorldSearch").oninput = renderWorldBrowser;
   const wb = el("v2WorldBar"); if(wb) wb.onchange = e=> onV2UniverseChange(e.target.value);
   const pb = el("v2ProjectBar"); if(pb) pb.onchange = e=> onV2WorkChange(e.target.value);
   const cb = el("v2ChapterBar"); if(cb) cb.onchange = e=> onV2ChapterChange(e.target.value);
-  const mcb = el("mobChapterBar"); if(mcb) mcb.onchange = e=> onV2ChapterChange(e.target.value);
+  const mcb = el("mobChapterBar");
+  if(mcb){
+    // 任务3:窄屏是按钮(点开弹层),宽屏仍是原生下拉 —— 按元素类型分流
+    if(mcb.tagName === "SELECT") mcb.onchange = e=> onV2ChapterChange(e.target.value);
+    else mcb.onclick = openMobChapterSheet;
+  }
+  if(el("mobHistBtn")) el("mobHistBtn").onclick = ()=> toggleMobHistStrip();      // 任务2.3
+  if(el("mobChapterNew")) el("mobChapterNew").onclick = async ()=>{ closeMobChapterSheet(); await v2NewChapter(); };
+  if(el("mobChapterClose")) el("mobChapterClose").onclick = closeMobChapterSheet;
+  const mcs = el("mobChapterSheet"); if(mcs) mcs.onclick = e=>{ if(e.target === mcs) closeMobChapterSheet(); };
   // 移动端:缩短长控件文案(指令占位符)
   if(matchMedia("(max-width:900px)").matches){
     const _ins = el("instruction");
-    if(_ins) _ins.placeholder = "续写指令（可选）";
+    if(_ins) _ins.placeholder = "续写指令(可选)";
   }
   if(el("v2NewWorld")) el("v2NewWorld").onclick = v2NewWorld;
 if(el("v2NewWorldSB")) el("v2NewWorldSB").onclick = v2NewWorld;  // 世界浏览器侧边栏头部(与v2-bar重复id,已改唯一)
@@ -3484,9 +4074,9 @@ if(el("v2NewWorldSB")) el("v2NewWorldSB").onclick = v2NewWorld;  // 世界浏览
   if(el("wmNewWorld")) el("wmNewWorld").onclick = ()=> v2NewWorld().then(renderWorldManager);
   if(el("wmMergeLegacy")) el("wmMergeLegacy").onclick = ()=> migrateLegacyToV2(true);
   if(el("wmClose")) el("wmClose").onclick = ()=> el("worldManagerSheet").classList.remove("open");
-  // 页面导航（工作台 / 宇宙管理 / 提示词工具）
+  // 页面导航(工作台 / 宇宙管理 / 提示词工具)
   bindPageNav();
-  // 全局|世界传说 灰框：点空白展开候选；点外部关闭
+  // 全局|世界传说 灰框:点空白展开候选;点外部关闭
   const gpop = el("v2GlobalPop");
   if(gpop){
     gpop.onclick = e=>{
@@ -3494,7 +4084,7 @@ if(el("v2NewWorldSB")) el("v2NewWorldSB").onclick = v2NewWorld;  // 世界浏览
       const c = el("v2GlobalCands"); if(c) c.classList.toggle("open");
     };
   }
-  // 🌏 平行宇宙弹层：点空白展开候选绑定(与🌐同款)
+  // 🌏 平行宇宙弹层:点空白展开候选绑定(与🌐同款)
   const upop = el("v2UniPop");
   if(upop){
     upop.onclick = e=>{

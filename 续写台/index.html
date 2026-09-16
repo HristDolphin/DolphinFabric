@@ -2,7 +2,9 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<!-- interactive-widget=resizes-content:安卓弹输入法时让「布局视口」随键盘收缩,
+       底部工具条/预览区不被键盘盖住,固定元素也不再"跑位"(20260916) -->
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content" />
 <meta name="theme-color" content="#0c0c12" />
 <meta name="mobile-web-app-capable" content="yes" />
 <meta name="apple-mobile-web-app-capable" content="yes" />
@@ -100,18 +102,41 @@
     </div>
   </div>
 
-  <!-- 放大编辑弹窗 -->
+  <!-- 放大编辑弹窗(完整编辑: 无需齿轮即可编辑全部高级内容) -->
   <div id="wbZoomSheet" class="sheet">
     <div class="card wb-zoom-card">
       <div class="wm-head">
-        <h3>放大编辑条目</h3>
+        <h3>编辑条目</h3>
         <div class="wm-actions"><button id="wbZoomClose" class="mini-btn ghost">关闭</button></div>
       </div>
       <div class="wb-zoom-form">
-        <label>标题 <input id="wbZoomTitle" class="name-input"></label>
-        <label>主触发词（逗号分隔） <input id="wbZoomKeys" class="name-input" placeholder="关键词, 逗号分隔"></label>
+        <div class="wbz-row wbz-row1">
+          <label class="wbz-en"><input type="checkbox" id="wbZoomEnable"> 启用</label>
+          <input id="wbZoomTitle" class="name-input" placeholder="标题">
+        </div>
+        <div class="wbz-row wbz-row2">
+          <input id="wbZoomKeys" class="name-input" placeholder="主触发词, 逗号分隔">
+          <select id="wbZoomLogic" title="主词A 与 副词B(过滤器) 的组合逻辑">
+            <option value="0">任意 OR(主或副任一)</option>
+            <option value="3">与所有 AND(主且副同时)</option>
+            <option value="1">非所有 NAND(非全命中)</option>
+            <option value="2">非任何 NOR(都不命中)</option>
+          </select>
+          <input id="wbZoomKeys2" class="name-input" placeholder="副触发词(过滤器), 逗号分隔">
+        </div>
         <label>注入内容</label>
         <textarea id="wbZoomBody" class="wb-zoom-body" placeholder="注入AI的条目信息…"></textarea>
+        <div class="wbz-row wbz-row4">
+          <select id="wbZoomMode" title="激活模式:常驻=蓝,关键词=绿,向量=🔗">
+            <option value="logic">关键词(绿)</option>
+            <option value="constant">常驻(蓝)</option>
+            <option value="vector">向量(🔗)</option>
+          </select>
+          <select id="wbZoomPos" title="插入位置"></select>
+          <label>深度 <input id="wbZoomDepth" type="number" min="0" max="10" value="0" title="仅「前文内」生效:0=紧贴断点前"></label>
+          <label>顺序 <input id="wbZoomOrder" type="number" min="0" value="100" title="同级(同位置)时越大注入越靠后、影响越大"></label>
+          <label class="chk"><input type="checkbox" id="wbZoomScan" checked> 参与扫描</label>
+        </div>
         <div class="wb-zoom-actions">
           <button id="wbZoomSave" class="btn primary">保存</button>
           <button id="wbZoomClose2" class="btn">取消</button>
@@ -120,24 +145,24 @@
     </div>
   </div>
 
-  <!-- 提示词工具页（首个功能：风格预设编辑） -->
+  <!-- 提示词工具页（风格预设 / 系统提示词 / 词库管理） -->
   <div id="promptPage" class="prompt-page" style="display:none">
     <div class="prompt-head">
-      <strong>提示词工具 · 风格预设</strong>
+      <strong>风格预设</strong>
       <div class="prompt-actions">
+        <button id="prefClearLocal" class="mini-btn danger" style="display:none" title="清空浏览器本地预设（不影响服务端）">清空</button>
         <button id="styleAdd" class="mini-btn">＋ 新建风格</button>
-        <button id="styleReset" class="mini-btn">恢复内置</button>
       </div>
     </div>
     <div id="styleList" class="style-list"></div>
 
     <div class="prompt-head" style="margin-top:10px">
-      <strong>提示词条目</strong>
+      <strong>系统提示词</strong>
       <div class="prompt-actions">
-        <button id="piAdd" class="mini-btn">＋ 新建条目</button>
+        <button id="sysOpenBtn" class="mini-btn">编辑</button>
       </div>
     </div>
-    <div id="piList" class="style-list"></div>
+    <div id="sysBrowserBox" class="sys-box"></div>
 
     <!-- 词库管理（第二栏：安全闸门哈希库） -->
     <div class="prompt-head" style="margin-top:10px">
@@ -176,7 +201,7 @@
       </div>
 
       <div class="pp-section">
-        <div class="pp-sec-title">① 采样参数</div>
+        <div class="pp-sec-title">① 采样参数（基准值；风格强度在其上做有限偏移）</div>
         <div class="pp-grid">
           <label>温度 temperature<input id="pTemperature" type="range" min="0" max="2" step="0.05"><output id="oTemperature">0.8</output></label>
           <label>top_p<input id="pTopP" type="range" min="0" max="1" step="0.01"><output id="oTopP">0.9</output></label>
@@ -185,6 +210,7 @@
           <label>min_p<input id="pMinP" type="range" min="0" max="0.5" step="0.01"><output id="oMinP">0.05</output></label>
           <label>max_tokens<input id="pMaxTok" type="range" min="100" max="4000" step="50"><output id="oMaxTok">900</output></label>
         </div>
+        <div id="paramHint" class="param-hint"></div>
         <div class="pp-actions">
           <button id="presetManual" class="mini-btn">调参手册</button>
           <button id="presetSave" class="mini-btn" title="将当前参数存为本模型预设（自动按模型记忆）">存为预设</button>
@@ -200,6 +226,35 @@
 
       <div class="pp-actions pp-foot">
         <button id="saveModelCfg" class="btn primary" title="把当前模板/参数绑定到本模型（系统提示词已全局化，不随模型）">保存为本模型配置</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 竖屏章节弹层(任务书 260916b 任务3):列表 + 新建 -->
+  <div id="mobChapterSheet" class="sheet">
+    <div class="card param-card">
+      <div class="pp-head">
+        <strong>章节</strong>
+        <span class="hint">点条目切换；「新建章节」会自动命名「第 N 章」</span>
+        <button id="mobChapterClose" class="icon-btn">×</button>
+      </div>
+      <div id="mobChapterList" class="mob-chapter-list"></div>
+      <div class="pp-actions pp-foot">
+        <button id="mobChapterNew" class="btn primary">＋ 新建章节</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 新建风格：模板选择（需求6：内置风格不再默认注入，仅作模板） -->
+  <div id="tplSheet" class="sheet">
+    <div class="card param-card">
+      <div class="pp-head">
+        <strong>选择风格模板</strong>
+        <span class="hint">仅作参考；选中后会新建一条风格并写入服务端</span>
+        <button id="tplCancel" class="icon-btn">×</button>
+      </div>
+      <div class="pp-section">
+        <div id="tplList" class="tpl-list"></div>
       </div>
     </div>
   </div>
@@ -260,12 +315,13 @@
     <section class="editor-wrap">
       <div class="editor-head">
         <input id="curName" class="name-input" />
-        <select id="mobChapterBar" class="mob-chapter-sel"></select>
+        <button id="mobChapterBar" class="mob-chapter-sel" type="button" title="章节列表 · 可新建">选择章节</button>
         <span id="charCount" class="hint">0 字</span>
         <button id="mobStyleBtn" class="icon-btn mob-only" title="文风与系统提示词">🎨</button>
 <button id="togglePreview" class="icon-btn">⬇</button>
         <button id="toggleThink" class="icon-btn" title="思考面板（移动端为折叠预览）">🧠</button>
         <button id="safeBtn" class="icon-btn" title="一键安全：把正文敏感内容替换为安全表述">🛡</button>
+        <button id="mobMoreBtn" class="icon-btn mob-only" title="更多（查看请求 / 自动脱敏）">▼</button>
         <button id="togglePool" class="icon-btn" title="设定池">☰</button>
       </div>
       <div class="editor-body">
@@ -330,6 +386,7 @@
     </div>
     <div class="draft-zone">
       <div class="draft-main">
+        <div id="mobHistStrip" class="hist-strip" style="display:none"></div>
         <textarea id="draftText" class="draft-text" placeholder="生成结果会显示在这里，可直接修改；满意后点「插入正文」。"></textarea>
       </div>
       <div class="draft-actions">
@@ -339,6 +396,7 @@
         <button id="acceptBtn" class="btn primary" disabled><span class="m-icon">✓</span><span class="m-text">插入正文</span></button>
         <button id="regenBtn" class="btn ghost"><span class="m-icon">⟳</span><span class="m-text">重新生成</span></button>
         <!-- 移动端三键:重做|修改|继续 -->
+        <button id="mobHistBtn" class="btn ghost mob-draft" title="历史版本（横滑卡片，点击即恢复）">🕘</button>
         <button id="mobRedo" class="btn primary mob-draft">重做</button>
         <button id="mobEdit" class="btn primary mob-draft">修改</button>
         <button id="mobCont" class="btn primary mob-draft">继续</button>
@@ -466,6 +524,11 @@
   <button data-page="prompt">提示词工具</button>
 </div>
 <div id="mobModelPop" class="mob-pop" style="display:none"></div>
+<div id="mobMorePop" class="mob-pop" style="display:none">
+  <div class="mob-pop-title">更多</div>
+  <button id="viewReqM" class="mob-pop-row"><span class="m-icon">👁</span><span class="m-text">查看请求</span></button>
+  <button id="safeBtnM" class="mob-pop-row"><span class="m-icon">🛡</span><span class="m-text">自动脱敏</span></button>
+</div>
 <div id="mobStylePop" class="mob-pop" style="display:none">
   <div class="mob-pop-title">文风 &amp; 系统提示词</div>
   <select id="mobStyleSel" class="mob-style-sel"></select>

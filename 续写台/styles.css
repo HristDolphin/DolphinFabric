@@ -397,13 +397,28 @@ select,input{font-family:inherit}
 .wi-row{border:1px solid var(--line);border-radius:10px;padding:6px 8px;margin-bottom:6px;background:var(--panel)}
 .wi-row.wi-off{opacity:.5}
 .wi-main{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
-.wi-en{display:flex;align-items:center;gap:3px;font-size:0.75rem;color:var(--muted);cursor:pointer;width:52px;flex-shrink:0}
+.wi-en{display:flex;align-items:center;gap:5px;font-size:0.72rem;cursor:pointer;flex-shrink:0;border-radius:6px;padding:3px 9px;color:#fff;line-height:1;border:1px solid transparent}
+.wi-en-con{background:#2563eb;border-color:#3b82f6}
+.wi-en-log{background:#16a34a;border-color:#22c55e}
+.wi-en-vec{background:#7c3aed;border-color:#8b5cf6}
+.wi-en-dis{background:#4b5563;border-color:#6b7280;opacity:.8}
+.wi-en .wi-en-tag{font-weight:600;letter-spacing:.5px;white-space:nowrap}
+.wi-en .wi-en-off{font-style:italic;opacity:.9;margin-left:2px;font-size:0.68rem}
+.wi-en input{accent-color:#fff;margin:0}
+/* 条目折叠态: 侧边栏显示 状态色块+逻辑徽章+标题+主触发词+⛲⚙✕, 隐藏正文/位置/顺序/📵/高级区 */
+.wi-compact .wi-body,.wi-compact .wi-pos,.wi-compact .wi-order,.wi-compact .wi-ch,.wi-compact .wi-detail{display:none!important}
+.wi-compact .wi-title{flex:0 1 140px;min-width:80px}
+.wi-compact .wi-keys{flex:1 1 auto;min-width:80px}
+.wi-compact .wi-more{margin-left:auto}
 .wi-title,.wi-keys,.wi-keys2{background:var(--panel-2);border:1px solid var(--line);border-radius:6px;padding:4px 6px;color:var(--text);font-size:0.75rem}
 .wi-title{flex:0 1 120px;min-width:70px}
 .wi-keys{flex:0 1 130px;min-width:80px}
 .wi-keys2{flex:0 1 130px;min-width:80px}
 .wi-body{flex:1 1 220px;min-width:150px;background:var(--panel-2);border:1px solid var(--line);border-radius:6px;padding:4px 6px;color:var(--text);font-size:0.75rem;resize:vertical;font-family:inherit}
 .wi-pos{background:var(--panel-2);color:var(--text);border:1px solid var(--line);border-radius:6px;padding:4px 4px;font-size:0.75rem}
+.wi-order{width:58px;background:var(--panel-2);color:var(--text);border:1px solid var(--line);border-radius:6px;padding:4px 4px;font-size:0.75rem}
+.wi-logic-badge{display:none;background:#334155;color:#94a3b8;border:1px solid var(--line);border-radius:5px;padding:2px 6px;font-size:0.65rem;font-weight:700;letter-spacing:.5px;flex-shrink:0;line-height:1.3}
+.wi-compact .wi-logic-badge{display:inline-block}
 .wi-more,.wi-del,.wi-ch{background:transparent;border:1px solid var(--line);border-radius:6px;color:var(--muted);cursor:pointer;font-size:0.75rem;padding:3px 7px;flex-shrink:0}
 .wi-del:hover{color:var(--warn);border-color:var(--warn)}
 .wi-ch:hover{color:var(--orange);border-color:var(--orange)}
@@ -466,6 +481,15 @@ select,input{font-family:inherit}
 .wb-zoom-form{padding:14px 18px;display:flex;flex-direction:column;gap:2px;overflow-y:auto}
 .wb-zoom-body{width:100%;min-height:44vh;resize:vertical;font-family:"Songti SC","SimSun",serif;line-height:1.7;font-size:1.3125rem;padding:10px 12px;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:8px}
 .wb-zoom-actions{display:flex;gap:8px;justify-content:flex-end;padding-top:12px}
+.wbz-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
+.wbz-row1 #wbZoomTitle{flex:1;min-width:140px}
+.wbz-row2 input{flex:1;min-width:120px}
+.wbz-row2 select{flex:0 0 auto;background:var(--panel-2);color:var(--text);border:1px solid var(--line);border-radius:6px;padding:6px 6px;font-size:0.8rem}
+.wbz-row4 select{background:var(--panel-2);color:var(--text);border:1px solid var(--line);border-radius:6px;padding:6px 6px;font-size:0.8rem}
+.wbz-row4 label{display:flex;align-items:center;gap:4px;font-size:0.78rem;color:var(--muted);white-space:nowrap}
+.wbz-row4 input[type=number]{width:62px;background:var(--panel-2);color:var(--text);border:1px solid var(--line);border-radius:6px;padding:5px 6px;font-size:0.8rem}
+.wbz-en{display:flex;align-items:center;gap:5px;font-size:0.85rem;font-weight:600;flex-shrink:0;color:var(--text)}
+.wbz-en input{accent-color:var(--accent,#6c5ce7)}
 .wi-zoom{margin-left:auto}
 /* 思考/预览标题行已移除，清空与状态并入右侧按钮区 */
 /* 右侧按钮区内的状态文字与清空按钮 */
@@ -511,7 +535,9 @@ input[type=range]::-moz-range-track{height:6px;border-radius:3px;background:var(
   }
   .sidebar.v2-panel.open{transform:translateX(0)}
   .sidebar.v2-panel:not(.open){display:flex}
-  .v2-collapsed-tab{top:auto;bottom:100px;width:30px;height:60px;z-index:46;border-radius:0 10px 10px 0}
+  /* 20260916:原来锚在视口底部(bottom:100px),安卓呼出输入法时位置会变/被键盘盖住,
+     使用者得先找位置再点 → 改为锚在顶部编辑器头之下,永不随键盘移动 */
+  .v2-collapsed-tab{top:100px;bottom:auto;width:30px;height:60px;z-index:46;border-radius:0 10px 10px 0}
   /* 右：世界设定 → 覆盖式抽屉 */
   .sidebar{
     position:fixed;right:0;top:0;bottom:0;width:84vw;max-width:360px;z-index:45;
@@ -563,7 +589,7 @@ input[type=range]::-moz-range-track{height:6px;border-radius:3px;background:var(
   /* ---- 彻底简化:隐藏 v2-bar 第二排,章节下拉移入标题行 ---- */
   .v2-bar{display:none}
   .mob-chapter-sel{display:block;max-width:108px;background:var(--panel-2);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:4px 6px;font-size:0.8125rem;flex-shrink:0}
-  #togglePreview,#togglePool,#charCount{display:none}
+  #togglePreview,#togglePool,#charCount,#safeBtn{display:none}   /* 任务2.1:脱敏已并入 ▼ 更多弹窗 */
   .name-input{font-size:0.9375rem}
   /* composer:只留 模式+指令+撤销+续写,隐藏次要按钮 */
   .composer-btns #viewReqBtn,.composer-btns #toggleHistory{display:none}
@@ -602,7 +628,8 @@ input[type=range]::-moz-range-track{height:6px;border-radius:3px;background:var(
   /* 页面名加颜色 */
   #mobPageTitle{color:var(--accent)}
   /* 右抽屉折叠标签:收起时显示,展开时隐藏 */
-  .pool-tab{display:flex;top:auto;bottom:100px;width:30px;height:60px;border-radius:10px 0 0 10px;z-index:46}
+  /* 20260916:同上,右侧「世界设定」标签同步改为顶部锚定,与左侧对称 */
+  .pool-tab{display:flex;top:100px;bottom:auto;width:30px;height:60px;border-radius:10px 0 0 10px;z-index:46}
   #sidebar:not(.open) ~ .pool-tab.show{display:flex}
   #sidebar.open ~ .pool-tab{display:none}
   /* 抽屉滚动条隐藏(消除额外滑块宽度,左右视觉均匀) */
@@ -685,3 +712,96 @@ html.restore-universe .prompt-page, html.restore-prompt .prompt-page{animation:n
   .wm-wb-body .wi-more,.wm-wb-body .wi-del,.wm-wb-body .wi-ch{padding:2px 5px}
   .wm-wb-body .wi-detail{margin-top:3px;padding-top:3px;gap:6px}
 }
+
+
+/* ============ 预设双区（任务书 20260916a）============ */
+.style-group-title{display:flex;align-items:center;gap:8px;margin:10px 0 6px;font-size:0.8rem;color:var(--text)}
+.sg-tag{font-size:0.68rem;padding:1px 6px;border-radius:999px;border:1px solid var(--line)}
+.sg-tag.sg-server{color:#6ee7b7;border-color:rgba(110,231,183,.45)}
+.sg-tag.sg-local{color:#fbbf24;border-color:rgba(251,191,36,.5)}
+/* 浏览器版本条目：高亮边框提示"未提交" */
+.style-item.local{border-color:#f59e0b;background:linear-gradient(0deg,rgba(245,158,11,.06),rgba(245,158,11,.06)),var(--panel-2)}
+.style-badge.bp-local{color:#fbbf24;border:1px solid rgba(251,191,36,.5);border-radius:999px;padding:1px 6px;font-size:0.68rem}
+.mini-btn.primary{background:linear-gradient(135deg,var(--accent),var(--accent-2));color:var(--text-strong);border-color:transparent}
+.mini-btn.danger{color:#fca5a5;border-color:rgba(248,113,113,.45)}
+.mini-btn.danger:hover{border-color:#f87171}
+/* 系统提示词的「浏览器版本」块 */
+.browser-pref{border:1px dashed #f59e0b;border-radius:12px;padding:10px 12px;background:rgba(245,158,11,.05);margin:6px 0 10px}
+.browser-pref-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px}
+.bp-tag{background:#f59e0b;color:#1a1200;font-size:0.68rem;font-weight:600;padding:2px 7px;border-radius:999px}
+.bp-hint{font-size:0.72rem;color:var(--muted,#9a9aa8)}
+.bp-sys{width:100%;box-sizing:border-box;background:var(--panel-2);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:8px;font-size:0.82rem;line-height:1.5;margin-bottom:8px}
+/* 风格模板选择 */
+.tpl-list{display:flex;flex-direction:column;gap:8px;max-height:52vh;overflow:auto}
+.tpl-item{border:1px solid var(--line);background:var(--panel-2);border-radius:10px;padding:10px 12px;cursor:pointer}
+.tpl-item:hover{border-color:var(--accent)}
+.tpl-item:active{border-color:var(--accent-2)}
+.tpl-name{font-size:0.88rem;font-weight:600}
+.tpl-desc{font-size:0.74rem;color:var(--muted,#8b8b9a);margin-top:2px}
+
+
+/* ============ 预设区简洁版（20260916 二改反馈）============ */
+/* 条目行更紧凑：单行显示 名称 + 状态标 + 操作 */
+.style-item{padding:6px 10px}
+.style-item-head{gap:8px}
+.style-ops{display:flex;gap:6px;margin-left:auto;flex-wrap:wrap}
+/* 黄标：浏览器本地未提交 */
+.style-badge.bp-local{color:#b45309;background:#fde68a;border:1px solid #f59e0b;border-radius:999px;padding:0 6px;font-size:0.68rem;line-height:1.5}
+.style-item.local{border-color:#f59e0b;border-left-width:3px}
+/* 系统提示词：两行文本对照 */
+.sys-box{margin:0}
+.sys-line{display:flex;gap:6px;align-items:flex-start;padding:6px 8px;border-bottom:1px solid var(--line);font-size:0.82rem;line-height:1.5}
+.sys-line:last-child{border-bottom:none}
+.sys-lab{flex:none;color:var(--muted,#8b8b9a)}
+.sys-lab.local{color:#b45309;font-weight:600}
+.sys-txt{flex:1;min-width:0;color:var(--text);word-break:break-word;white-space:pre-wrap}
+.sys-ops{flex:none;display:flex;gap:6px}
+.sys-empty{color:var(--muted,#8b8b9a)}
+
+
+/* ---- 风格偏移层(20260916) ---- */
+.param-hint{margin:8px 0 0;padding:6px 8px;border-radius:6px;background:rgba(245,158,11,.10);
+  border:1px solid rgba(245,158,11,.35);color:#b45309;font-size:12px;line-height:1.5}
+.style-badge.st-s{background:rgba(59,130,246,.12);border:1px solid rgba(59,130,246,.35);color:#1d4ed8}
+.style-badge.st-legacy{background:rgba(107,114,128,.14);border:1px solid rgba(107,114,128,.4);color:#4b5563}
+.se-s{width:150px;vertical-align:middle}
+.se-s-out{margin-left:6px;color:#b45309;font-variant-numeric:tabular-nums}
+.se-dir{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:6px;margin-top:6px}
+.se-dir label{font-size:12px}
+.se-dir select{padding:2px 4px}
+.se-legacy{margin-top:6px;padding:6px 8px;border-radius:6px;background:rgba(107,114,128,.12);
+  border:1px solid rgba(107,114,128,.35);color:#4b5563;font-size:12px;line-height:1.5}
+
+
+/* ============ 任务书 260916b:竖屏快捷入口 ============ */
+/* 任务2.3 历史横滑卡片:左旧右新,一屏可见 2.5 张(卡片 40%),点击即恢复 */
+/* 任务2.3(修订):点🕘 → 卡片浮层覆盖整个预览编辑区;再点🕘 关闭(不动用户正在编辑的内容) */
+.hist-strip{position:absolute;inset:0;display:none;gap:8px;overflow-x:auto;overflow-y:hidden;scroll-snap-type:x mandatory;
+  padding:8px;background:var(--panel);border:1px solid var(--line);border-radius:10px;z-index:5;-webkit-overflow-scrolling:touch}
+.hist-strip::-webkit-scrollbar{display:none;scrollbar-width:none}
+.hist-card{flex:0 0 40%;min-width:40%;align-self:stretch;display:flex;flex-direction:column;scroll-snap-align:start;
+  border:1px solid var(--line);border-radius:10px;padding:8px 10px;background:var(--panel-2);cursor:pointer;overflow:hidden}
+.hist-card:active{border-color:#5AB4FB}
+.hc-meta{font-size:0.68rem;color:var(--muted);margin-bottom:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.hc-text{font-size:0.85em;line-height:1.5;color:#5B9BF5;text-decoration:underline;text-underline-offset:2px;flex:1;overflow:hidden;
+  display:-webkit-box;-webkit-line-clamp:8;-webkit-box-orient:vertical;word-break:break-word}
+.hist-empty{padding:2px 4px;white-space:nowrap}
+/* 任务2.2 聚合弹层条目(竖排:图标+文字) */
+.mob-pop button.mob-pop-row{display:flex;align-items:center;gap:8px}
+.mob-pop button.mob-pop-row.on{color:#6ee7b7}
+.mob-pop button.mob-pop-row .m-icon{flex:0 0 auto}
+/* 任务3 竖屏章节弹层 */
+.mob-chapter-list{display:flex;flex-direction:column;gap:6px;max-height:52vh;overflow-y:auto;margin:8px 0}
+.mob-chap-item{display:block;width:100%;text-align:left;padding:10px 12px;border:1px solid var(--line);border-radius:10px;
+  background:var(--panel-2);color:var(--text);font-size:0.9375rem;cursor:pointer}
+.mob-chap-item.on{border-color:var(--accent);color:var(--text-strong);font-weight:600}
+.mob-chapter-sel{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:left}
+/* 任务2.3 修订:🕘 独立在最左侧(不挤在三个按钮边上),底色 #5AB4FB */
+.draft-main{position:relative}
+/* 🕘 必须靠最左:.draft-actions 行里第一个元素是 #draftStatus(.draft-status-v{flex:1}),
+   它会把剩余空间吃光 → 光靠 margin-right:auto 挤不到最左。改用 order:-1 让它成为行的第一个元素,
+   状态位继续 flex:1 把 [重做][修改][继续] 推到右边。 */
+.draft-actions #mobHistBtn{order:-1;background:#5AB4FB;border-color:#5AB4FB;color:#0b1220}
+.draft-actions #mobHistBtn:active{filter:brightness(.92)}
+/* 任务2.2 修订:▼ 弹层贴右上(按钮在标题行右侧),不再出现在左边 */
+#mobMorePop{left:auto;right:8px;top:98px;min-width:190px}
