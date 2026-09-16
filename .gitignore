@@ -27,3 +27,10 @@ Universes/
 works/
 WorldBook/
 lorebooks/
+
+# 用户预设(系统提示词/风格预设等,含个人内容,不入库)
+prefs.json
+
+# 开发备份文件(不入库)
+*.bak_*
+serve.py.bak_*
