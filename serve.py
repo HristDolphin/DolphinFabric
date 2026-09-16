@@ -11,7 +11,7 @@
   _global.json               全局索引（含状态）：{globalActiveWB:[wb_id...]}
 每次 导入/新建/删除 后自动重建索引。
 """
-import os, sys, json, re, time, shutil, hashlib, unicodedata, socket
+import os, sys, json, re, time, shutil, hashlib, unicodedata, socket, threading
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, unquote
 
@@ -21,18 +21,79 @@ U_DIR    = os.path.join(BASE_DIR, "Universes")
 W_DIR    = os.path.join(BASE_DIR, "works")
 INDEX_F  = os.path.join(BASE_DIR, "_index.json")
 GLOBAL_F = os.path.join(BASE_DIR, "_global.json")
-SCFG_F = os.path.join(BASE_DIR, "servercfg.json")  # 服务端配置:在线密钥/Base/Ollama(远程代理用,不入 git)
+SCFG_F = os.path.join(BASE_DIR, "servercfg.json")  # 服务端配置:在线 Base/Ollama(不再存密钥,不入 git)
+PREF_F = os.path.join(BASE_DIR, "prefs.json")      # 用户预设(系统提示词/风格预设/参数/提示词条目);不含任何密钥
+LORE_F = os.path.join(BASE_DIR, u"续写台", "lorebooks", "packs.json")  # 设定包(前端 packs)服务端落盘点
 
 def load_servercfg():
+    """服务端配置。**在线密钥永不由服务端持有**:历史遗留的 onlineKey 一律忽略。"""
     try:
         with open(SCFG_F, encoding="utf-8") as f:
-            return json.load(f)
+            cfg = json.load(f)
     except Exception:
         return {}
+    if isinstance(cfg, dict):
+        cfg.pop("onlineKey", None)
+    return cfg
 
 def save_servercfg(cfg):
+    cfg = dict(cfg or {})
+    cfg.pop("onlineKey", None)   # 双保险:任何调用都写不进密钥
     with open(SCFG_F, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=1)
+
+# ---- 用户预设(服务端落盘) ----
+# 为什么:系统提示词/风格预设等原先只存浏览器 localStorage,而 localStorage 按 origin(协议+主机+端口)
+# 隔离 —— 路由器重分 IP / 换端口后就是一份全新空存储,表现为预设被"重置"且旧数据难以找回。
+# 现在以服务端 prefs.json 为准,localStorage 仅作离线兜底。
+PREF_ALLOWED = ("sysPrompt", "styles", "style", "modelCfg", "params", "promptItems", "template", "mode", "cfg")
+# cfg 只允许落盘非敏感字段:onlineKey 永不落盘、永不下发
+PREF_CFG_ALLOWED = ("backend", "ollamaUrl", "onlineBase", "tailChars", "maxTokens",
+                    "think", "autoSummary", "scanEnabled", "fontScale")
+
+def _sanitize_prefs(obj):
+    out = {"updatedAt": int(time.time() * 1000)}
+    if not isinstance(obj, dict):
+        return out
+    for k in PREF_ALLOWED:
+        if k not in obj:
+            continue
+        if k == "cfg":
+            c = obj.get("cfg") or {}
+            if isinstance(c, dict):
+                out["cfg"] = {kk: c[kk] for kk in PREF_CFG_ALLOWED if kk in c}
+        else:
+            out[k] = obj[k]
+    return out
+
+def load_lorebooks():
+    """设定包(packs)读取:文件不存在/损坏时回空结构"""
+    cur = slurp(LORE_F, None)
+    if isinstance(cur, dict) and isinstance(cur.get("packs"), list):
+        return cur
+    return {"packs": [], "activePacks": [], "editPackId": ""}
+
+def save_lorebooks(body):
+    """设定包落盘:只收 packs/activePacks/editPackId 三字段,附 updatedAt"""
+    b = body if isinstance(body, dict) else {}
+    out = {
+        "packs": b.get("packs") if isinstance(b.get("packs"), list) else [],
+        "activePacks": b.get("activePacks") if isinstance(b.get("activePacks"), list) else [],
+        "editPackId": b.get("editPackId") if isinstance(b.get("editPackId"), str) else "",
+        "updatedAt": int(time.time() * 1000),
+    }
+    os.makedirs(os.path.dirname(LORE_F), exist_ok=True)
+    dump(LORE_F, out)
+    return out
+
+def load_prefs():
+    p = slurp(PREF_F, None)
+    return p if isinstance(p, dict) else {}
+
+def save_prefs(obj):
+    out = _sanitize_prefs(obj)
+    dump(PREF_F, out)
+    return out
 
 def ensure_dirs():
     for d in (WB_DIR, U_DIR, W_DIR):
@@ -613,9 +674,7 @@ class Handler(SimpleHTTPRequestHandler):
         allow |= {"127.0.0.1", "localhost", "0.0.0.0"}
         if not host or host not in allow:
             return self._send_json({"error": "proxy target not allowed: " + host}, 403)
-        # 在线目标且服务端有 key → 注入(浏览器无需带 key)
-        if sc.get("onlineKey") and host not in ("127.0.0.1", "localhost", "0.0.0.0"):
-            hdrs["Authorization"] = "Bearer " + sc["onlineKey"]
+        # 服务端不再代持在线密钥:Authorization 由客户端请求头自带(见 app.js apiHeaders),此处不再注入
         data = body.encode("utf-8") if isinstance(body, str) else body
         hdrs.pop("Connection", None)   # 由 http.client 管理
         hdrs.pop("Host", None)         # http.client 自动加
@@ -682,6 +741,31 @@ class Handler(SimpleHTTPRequestHandler):
             return {}
         return json.loads(self.rfile.read(n).decode("utf-8"))
 
+    def _prefs_item(self, body):
+        """需求4:单条提交 —— 把浏览器本地某一条预设 upsert 进服务端 prefs.json(仅单条,不提供批量)"""
+        if not isinstance(body, dict):
+            return self._send_json({"error": "bad body"}, 400)
+        field = body.get("field")
+        cur = load_prefs()
+        if field == "sysPrompt":
+            val = body.get("value")
+            if not isinstance(val, str):
+                return self._send_json({"error": "value must be string"}, 400)
+            cur["sysPrompt"] = val
+        elif field in ("styles", "promptItems"):
+            item = body.get("item")
+            if not isinstance(item, dict) or not item.get("id"):
+                return self._send_json({"error": "item.id required"}, 400)
+            arr = cur.get(field)
+            if not isinstance(arr, list):
+                arr = []
+            arr = [x for x in arr if not (isinstance(x, dict) and x.get("id") == item.get("id"))]
+            arr.append(item)
+            cur[field] = arr
+        else:
+            return self._send_json({"error": "unsupported field: %s" % field}, 400)
+        return self._send_json(save_prefs(cur), 200)
+
     def do_GET(self):
         p = urlparse(self.path).path
         # 重构后 API
@@ -698,13 +782,20 @@ class Handler(SimpleHTTPRequestHandler):
             wb = get_worldbook(unquote(m.group(1)))
             return self._send_json(wb, 200 if wb else 404)
         if p == "/api/servercfg":
+            # 只回传地址类配置;密钥永不出服务端(服务端也已不再持有)
             sc = load_servercfg()
-            return self._send_json({"onlineBase": sc.get("onlineBase", ""), "ollamaUrl": sc.get("ollamaUrl", ""), "hasKey": bool(sc.get("onlineKey"))})
+            return self._send_json({"onlineBase": sc.get("onlineBase", ""), "ollamaUrl": sc.get("ollamaUrl", "")})
+        if p == "/api/prefs":
+            return self._send_json(load_prefs())
+        if p == "/api/lorebooks":
+            return self._send_json(load_lorebooks())
         if p == "/api/cleanup":
             return self._send_json(clean_indexes())
         if p == "/api/ping":
             # 手机 APP 局域网自动发现:指纹验证(排除路由器等误报)
-            return self._send_json({"app": "xietai", "port": 8000, "name": "续写台"})
+            # port 取实际监听端口(不再硬编码 8000),自定义端口时手机端信息才准
+            return self._send_json({"app": "xietai", "port": int(self.server.server_address[1]), "name": "续写台",
+                                    "proto": DISCOVERY_PROTO, "pc_version": pc_version()})
         if p == "/api/universes":
             return self._send_json({"universes": list_universes()})
         m = re.match(r"^/api/universes/([^/]+)$", p)
@@ -749,6 +840,10 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._send_json(build_user_rule(body.get("cat"), body.get("label"), body.get("words")), 200)
             except ValueError as e:
                 return self._send_json({"error": str(e)}, 400)
+        if p == "/api/prefs/item":
+            return self._prefs_item(self._body_json())
+        if p == "/api/lorebooks":
+            return self._send_json(save_lorebooks(self._body_json()), 200)
         if p == "/api/proxy":
             return self._proxy()
         if p == "/api/worldbooks/import":
@@ -778,11 +873,18 @@ class Handler(SimpleHTTPRequestHandler):
             return self._send_json(c, 200)
         if p == "/api/servercfg":
             sc = load_servercfg()
-            for k in ("onlineBase", "onlineKey", "ollamaUrl"):
+            for k in ("onlineBase", "ollamaUrl"):   # 不再接受 onlineKey:服务端不持有密钥
                 if k in body:
                     sc[k] = body[k]
             save_servercfg(sc)
-            return self._send_json({"ok": True, "hasKey": bool(sc.get("onlineKey"))})
+            return self._send_json({"ok": True})
+        if p == "/api/prefs":
+            # 乐观并发校验:客户端带 expectedUpdatedAt 且与服务端不一致 → 409(服务端权威,不被覆盖)
+            cur = load_prefs()
+            exp = body.get("expectedUpdatedAt") if isinstance(body, dict) else None
+            if exp is not None and cur.get("updatedAt") and int(exp) != int(cur.get("updatedAt")):
+                return self._send_json({"error": "stale", "serverUpdatedAt": cur.get("updatedAt"), "prefs": cur}, 409)
+            return self._send_json(save_prefs(body), 200)
         if p == "/api/global":
             g = body if isinstance(body, dict) else {}
             g.setdefault("globalActiveWB", [])
@@ -818,6 +920,130 @@ class Handler(SimpleHTTPRequestHandler):
             return self._send_json({"ok": True})
         self._send_json({"error": "unknown DELETE " + p}, 405)
 
+# ===== 版本号(单一来源:磁盘 version.json) =====
+# A2:PC 版本号唯一来源为工程根 version.json(与仓库同根,GitHub Pages 也托管同一份),
+#     不在多处硬编码;改文件即生效,无需改代码。
+#     /api/ping 与 UDP 应答都会下发,供 D4C 读取(A1)。
+PC_VERSION_FILE = os.path.join(BASE_DIR, "version.json")
+PC_VERSION_FALLBACK = "26.67.9"          # 文件缺失/损坏时的兜底,与仓库 version.json 保持一致
+
+
+def pc_version():
+    """读 version.json 的 versions.pc;失败回退 PC_VERSION_FALLBACK"""
+    try:
+        obj = slurp(PC_VERSION_FILE, None)
+        if isinstance(obj, dict):
+            v = ((obj.get("versions") or {}).get("pc")) or ""
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    except Exception:
+        pass
+    return PC_VERSION_FALLBACK
+
+
+# ===== LAN Discovery Protocol (UDP 寻呼) =====
+# 手机端广播 Probe(magic+type) → 本服务校验后单播回复 {ip, port}, 取代 254 个 IP 的暴力遍历。
+DISCOVERY_PORT  = 45678
+DISCOVERY_MAGIC = "XIETAI_DISCOVER_V1"
+DISCOVERY_PROTO = 1
+
+
+def _lan_ipv4_candidates():
+    """本机局域网 IPv4 候选(排除回环)"""
+    ips = []
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            if not ip.startswith("127.") and ip not in ips:
+                ips.append(ip)
+    except Exception:
+        pass
+    if not ips:
+        try:
+            sk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sk.connect(("8.8.8.8", 80))
+            ips.append(sk.getsockname()[0])
+            sk.close()
+        except Exception:
+            pass
+    return ips
+
+
+def _pick_lan_ip(src_ip):
+    """优先返回与请求方同网段的 IPv4,否则第一个候选(多网卡时避免报错网段)"""
+    cands = _lan_ipv4_candidates()
+    if src_ip:
+        parts = str(src_ip).split(".")
+        if len(parts) == 4:
+            pref = ".".join(parts[:3]) + "."
+            for ip in cands:
+                if ip.startswith(pref):
+                    return ip
+    return cands[0] if cands else "0.0.0.0"
+
+
+class DiscoveryResponder(threading.Thread):
+    """UDP 寻呼应答线程:校验 magic/type,失败静默丢弃(不回复)"""
+
+    def __init__(self, web_port, port=DISCOVERY_PORT, host="0.0.0.0"):
+        super().__init__(daemon=True, name="DiscoveryResponder")
+        self.web_port = web_port
+        self.port = port
+        self.host = host
+        self.sock = None
+        self._stop = False
+
+    def run(self):
+        try:
+            sk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sk.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sk.bind((self.host, self.port))
+            self.sock = sk
+        except Exception as e:
+            print("[discovery] 启动失败(udp %d): %s" % (self.port, e))
+            return
+        print("[discovery] UDP 寻呼已就绪  端口=%d  magic=%s  proto=%d" % (self.port, DISCOVERY_MAGIC, DISCOVERY_PROTO))
+        while not self._stop:
+            try:
+                data, addr = sk.recvfrom(4096)
+            except OSError:
+                break
+            except Exception:
+                continue
+            try:
+                msg = json.loads(data.decode("utf-8", "ignore"))
+            except Exception:
+                continue
+            if not isinstance(msg, dict):
+                continue
+            # magic / type 校验失败 → 丢弃,不回复(避免误应答其他 UDP 服务)
+            if msg.get("magic") != DISCOVERY_MAGIC or msg.get("type") != "discover_request":
+                continue
+            reply = {
+                "magic": DISCOVERY_MAGIC,
+                "type": "discover_response",
+                "proto": DISCOVERY_PROTO,
+                "app": "xietai",
+                "name": "续写台",
+                "ip": _pick_lan_ip(addr[0]),
+                "port": self.web_port,
+                "pc_version": pc_version(),
+            }
+            try:
+                sk.sendto(json.dumps(reply, ensure_ascii=False).encode("utf-8"), addr)
+                print("[discovery] probe %s:%d → 已回复 %s:%d" % (addr[0], addr[1], reply["ip"], reply["port"]))
+            except Exception as e:
+                print("[discovery] 回复失败: %s" % e)
+
+    def stop(self):
+        self._stop = True
+        try:
+            if self.sock:
+                self.sock.close()
+        except Exception:
+            pass
+
+
 def main():
     ensure_dirs()
     load_rules()
@@ -840,6 +1066,12 @@ def main():
         port = int(sys.argv[sys.argv.index("--port") + 1])
     if "--host" in sys.argv:
         host = sys.argv[sys.argv.index("--host") + 1]
+    disc_port = DISCOVERY_PORT
+    disc_on = True
+    if "--discovery-port" in sys.argv:
+        disc_port = int(sys.argv[sys.argv.index("--discovery-port") + 1])
+    if "--no-discovery" in sys.argv:
+        disc_on = False
     root_path = os.path.join(BASE_DIR, root)
     if not os.path.isdir(root_path):
         print("目录不存在:", root_path); sys.exit(1)
@@ -866,6 +1098,9 @@ def main():
         return ips
     for ip in _local_ips():
         print("  LAN/phone access: http://%s:%d/" % (ip, port))
+    if disc_on:
+        # UDP 寻呼应答(独立线程,不影响 Web 服务)
+        DiscoveryResponder(web_port=port, port=disc_port).start()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
