@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "updated_at": "2026-09-16",
+  "versions": {
+    "pc": "26.67.9",
+    "d4c": "1.0.3"
+  },
+  "announcement": {
+    "title": "D4C 1.0.3 更新",
+    "body": "本次更新：\n· 版本号三源对齐：PC 通过握手载荷下发 pc_version，可在连接页查看\n· 远程版本检查：启动时读取 version.json，提示是否有新版本\n· 密钥安全存储：在线密钥改存 Android Keystore，不再明文落盘\n· 公告去重：同一版本公告只推送一次",
+    "level": "normal"
+  }
+}
