@@ -8,12 +8,12 @@ if not exist "%PY%" (
   pause
   exit /b 1
 )
-REM 启动前清理占用端口 8003 的残留实例(避免 X 窗口后服务仍在)
-for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":8003.*LISTENING"') do (
+REM 启动前清理占用端口 8000 的残留实例(避免 X 窗口后服务仍在)
+for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":8000.*LISTENING"') do (
   taskkill /PID %%a /F >nul 2>&1
 )
-echo Starting DolphinFabric (port 8003)...
+echo Starting DolphinFabric (port 8000)...
 echo Ctrl+C 或关闭本窗口即停止服务
-start "" "http://127.0.0.1:8003/"
-"%PY%" serve.py xietai --port 8003
+start "" "http://127.0.0.1:8000/"
+"%PY%" serve.py xietai --port 8000
 pause

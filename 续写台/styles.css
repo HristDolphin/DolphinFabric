@@ -472,8 +472,9 @@ select,input{font-family:inherit}
 .wm-universe-pane{flex:2;display:flex;flex-direction:column;min-width:0;border:1px solid var(--line);border-radius:12px;overflow:hidden;background:var(--panel)}
 .wm-wb-head{padding:8px 12px;font-size:0.8125rem;font-weight:600;background:var(--panel-2);border-bottom:1px solid var(--line);display:flex;align-items:baseline;gap:8px}
 .wm-wb-head small{font-weight:400;color:var(--muted)}
-.wm-wb-body{flex:1;overflow-y:auto;padding:10px 12px}
+.wm-wb-body{display:flex;flex-direction:column;flex:1;min-height:0;overflow:hidden;padding:10px 12px}
 .wm-wb-body .v2-wb-toolbar{flex-wrap:wrap;margin-bottom:10px}
+.wm-wb-body .v2-curwb-entries{flex:1;min-height:0;max-height:none;overflow-y:auto}
 .wm-body{flex:1;overflow-y:auto}
 
 /* ============ 放大编辑弹窗 ============ */

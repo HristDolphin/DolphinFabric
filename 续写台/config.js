@@ -12,7 +12,11 @@ const CONFIG = {
   onlineKey: "",             // 在线 API 密钥
   embedModel: "mxbai-embed-large",  // 本地向量模型
   vectorThreshold: 0.6,      // 向量匹配相似度阈值
-  safeGate: true,            // 安全闸门:buildPrompt 拼装时自动过滤违规条目(本地哈希规则,无模型);默认开启(发布版不提供 UI 关闭)
+  // 在线 API 账号安全:buildPrompt 拼装时自动过滤违规条目(本地哈希规则,无模型调用)。
+  // 默认开启,可在「提示词工具-开发者设置」关闭;字段名沿用 safeGate 以兼容既有本地配置。
+  // 扩展位:判定实现约定返回 {violation, cats, labels}(见 app.js 的 SG_ACTIVE / 闸门调用点),
+  //         将来替换为服务端规则或模型侧审查时只需换实现,调用方无需改动。
+  safeGate: true,
   fontScale: 1,   // 界面字号档位:0.9375小 / 1中 / 1.0625大 / 1.125特大(只改字号基准)
 };
 

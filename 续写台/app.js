@@ -484,6 +484,7 @@ async function submitBrowserItem(field, id){
     payload = { field: field, item: item };
   }
   if(!confirm("提交到服务器?\n\n"+label+"\n\n会写入服务端 prefs.json(唯一权威源),并从浏览器版本中移除该条。")) return;
+  clearTimeout(_prefPushT);   // 修问题4:作废待发的"全量推送",避免与单条提交并发把服务端预设覆盖回旧快照
   try{
     const r = await fetchWithTimeout(location.origin + "/api/prefs/item", {
       method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(payload)
@@ -795,9 +796,18 @@ function onModelSwitch(name, force){
  * 尚未输出 </think>),把"最后一个未闭合开标签之后的全部内容"也归入 think,避免正文区被 reasoning 污染。
  * 返回 { think, body }。body 已 trim;多余空行由调用方 normalizeBlankLines 处理。
  */
+const _thinkWarned = new Set();
+/* 老社区模型:模板未实现 think 开关(#10584 中 think 是模板参数)→ "关思考"按钮实际无效。
+ * 命中这类模型(已由 400 记入黑名单)时给一次明确提示,避免用户以为功能坏了。 */
+function notifyThinkUnsupported(){
+  const m = state.model || "";
+  if(_thinkWarned.has(m)) return;
+  _thinkWarned.add(m);
+  v2Toast("该模型不支持关闭思考(模板未实现 think 开关),已改为本地剥离思考文本", "ok");
+}
 function splitThink(text){
   if(!text) return { think:"", body:"" };
-  const re = /<think>([\s\S]*?)<\/think>/g;
+  const re = /<think(?:ing)?>([\s\S]*?)<\/think(?:ing)?>/g;
   let m, think="", body="";
   let lastEnd = 0;
   while((m = re.exec(text)) !== null){
@@ -807,10 +817,10 @@ function splitThink(text){
   }
   let rest = text.slice(lastEnd);
   // 处理未闭合的 <think>:剩余部分若含开标签无闭合,其后全当思考
-  const openIdx = rest.indexOf("<think>");
-  if(openIdx >= 0){
-    body += rest.slice(0, openIdx);
-    think += (think ? "\n" : "") + rest.slice(openIdx + "<think>".length);
+  const mOpen = /<think(?:ing)?>/.exec(rest);
+  if(mOpen){
+    body += rest.slice(0, mOpen.index);
+    think += (think ? "\n" : "") + rest.slice(mOpen.index + mOpen[0].length);
   } else {
     body += rest;
   }
@@ -824,25 +834,30 @@ async function* streamChat(model, messages, { think=false, params={}, onThink } 
   const opt = { num_predict: Number(state.cfg.maxTokens || CONFIG.defaultMaxTokens) };   // 长度统一走系统设置
   for(const k of PARAM_KEYS){ if(params[k] !== undefined && params[k] !== null && params[k] !== "") opt[k] = Number(params[k]); }
 
-  // 不支持 thinking 的模型(首请求 400 后由 state.thinkBlacklist 记录)发 think:false
-  const wantThink = think && !state.thinkBlacklist.has(model);
+  // 思考开关的真相(依据 ollama/ollama#10584):think 是【模板参数】,只对模板声明了 thinking 的模型生效。
+  // 老社区模型(自带旧模板/直通模板)既不认 think:false,有的还会因顶层 think 直接 400 "does not support thinking"。
+  // 策略:不支持 thinking 的模型【完全不发 think 字段】(发 false 同样可能 400),并记入 thinkBlacklist 复用。
+  const noThinkSupport = state.thinkBlacklist.has(model);
+  const wantThink = think && !noThinkSupport;
 
-  async function oneShot(useThink){
+  async function oneShot(useThink, omit){
+    const payload = { model, messages, stream:true, options: opt };
+    if(!omit) payload.think = useThink;          // 仅支持的模型才携带 think
     const res = await apiFetch(state.cfg.ollamaUrl + "/api/chat", {
       method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({ model, messages, stream:true, think: useThink, options: opt })
+      body: JSON.stringify(payload)
     });
     return res;
   }
 
-  let res = await oneShot(wantThink);
-  // 400 且报不支持 thinking:标记该模型,自动用 think:false 重发一次(不报错给用户)
+  let res = await oneShot(wantThink, noThinkSupport);
+  // 400 且报不支持 thinking:记黑名单,改为【不带 think 字段】重发一次(不打扰用户)
   if(res.status === 400){
     let txt = ""; try{ txt = await res.text(); }catch{}
     if(/does not support thinking/i.test(txt)){
       state.thinkBlacklist.add(model);
       saveThinkBlacklist();
-      res = await oneShot(false);
+      res = await oneShot(false, true);
     }
   }
   if(!res.ok) throw new Error("Ollama 返回 "+res.status+"(确认服务已启动且允许跨域)");
@@ -885,12 +900,27 @@ function genOptions(params){
 async function* streamGenerate(model, prompt, { raw=true, params={} } = {}){
   // 在线模式:OpenAI 兼容 Text Completions(纯文本流,思考块以文本形式原样返回)
   if(state.cfg.backend === "online") return yield* streamGenerateOnline(model, prompt, { params });
+  const noThinkSupport = state.thinkBlacklist.has(model);
+  const wantOff = !!(state.cfg && state.cfg.think === false);
   const body = { model, prompt, stream:true, raw, options: genOptions(params) };
-  if(state.cfg && state.cfg.think === false) body.think = false;   // 本地补全通道也关思考(Qwen3/QwQ 等默认开)
-  const res = await apiFetch(state.cfg.ollamaUrl + "/api/generate", {
+  if(wantOff && !noThinkSupport) body.think = false;   // 本地补全也关思考(Qwen3/QwQ 默认开);不支持的模型不发该字段
+  let res = await apiFetch(state.cfg.ollamaUrl + "/api/generate", {
     method:"POST", headers:{"Content-Type":"application/json"},
     body: JSON.stringify(body)
   });
+  // 400 且"不支持 thinking":记黑名单并去掉 think 字段重发(补全通道原本没有降级,老模型会直接报错)
+  if(res.status === 400){
+    let txt = ""; try{ txt = await res.text(); }catch{}
+    if(/does not support thinking/i.test(txt)){
+      state.thinkBlacklist.add(model);
+      saveThinkBlacklist();
+      delete body.think;
+      res = await apiFetch(state.cfg.ollamaUrl + "/api/generate", {
+        method:"POST", headers:{"Content-Type":"application/json"},
+        body: JSON.stringify(body)
+      });
+    }
+  }
   if(!res.ok) throw new Error("Ollama generate 返回 " + res.status);
   const reader = res.body.getReader();
   const dec = new TextDecoder();
@@ -1173,6 +1203,7 @@ async function doGenerate(){
   if(!conn){ alert("无法连接 Ollama(" + state.cfg.ollamaUrl + "),请确认已启动后重试。"); return; }
 
   const project = curProject();
+  await ensureActiveWbsLoaded();                    // 修问题1/2:用前补齐(注入只认 wbCache)
   await refreshVectorMatches(project.text || "");   // 向量条目:正文语义匹配(embedding 不可用则静默不触发)
   if(state.mode === "chat") await ensureSummary(project);  // 摘要仅深度续写用到
   const built = await buildPrompt(project, el("instruction").value);
@@ -1221,6 +1252,7 @@ async function doGenerate(){
   const onThink = t => { el("thinkText").textContent += t; };
   // 续笔模式:直接要正文,强制 think:false(推理模型会把叙事塞进 thinking 块导致正文空)
   const useThink = (state.mode === "complete") ? false : state.cfg.think;
+  if(state.cfg.think === false && state.thinkBlacklist.has(state.model)) notifyThinkUnsupported();
   try{
     if(isCompletion){
       // 真补全:调 /api/generate 流式;raw 优先,失败自动回退默认模板(思考块仍在 response 文本里)
@@ -1899,19 +1931,19 @@ function wsMask(show){ const _m = el("wsMask"); if(_m){ _m.style.display = (show
   // [已移除·20260916 用户要求] 提示词条目 UI 入口（功能与注入链路保留，仅去掉预设管理页的展示）
   // 恢复方式见 续写台/archives/remove_promptitems_20260916/REMOVED.md
   // const piAdd = el("piAdd"); if(piAdd) piAdd.onclick = addPromptItem;
-  /* 开发者设置(已隐藏,发布版): 原 SafeGate 开关绑定已移除,在线过滤默认开启 */
-  //   // 开发者设置:在线过滤(SafeGate)开关
-  //   const devSG = el("devSafeGate");
-  //   if(devSG){
-  //     devSG.checked = state.cfg.safeGate !== false;
-  //     devSG.onchange = ()=>{
-  //       state.cfg.safeGate = devSG.checked;
-  //       saveCfg();
-  //       hideGateHint();   // 开关切换:隐藏残留提示
-  //       renderSanitizeBtn();
-  //       v2Toast(devSG.checked ? "在线过滤已开启:在线模式下⚠️条目等同关闭" : "在线过滤已关闭:⚠️条目恢复原设置", devSG.checked ? "ok" : "err");
-  //     };
-  //   }
+  // 开发者设置:在线 API 账号安全开关(默认开启,可关闭)
+  // 注:开关状态字段沿用 state.cfg.safeGate 以兼容既有本地配置,改字段名会让老用户开关状态丢失
+  const devSG = el("devAcctSafety");
+  if(devSG){
+    devSG.checked = state.cfg.safeGate !== false;
+    devSG.onchange = ()=>{
+      state.cfg.safeGate = devSG.checked;
+      saveCfg();
+      hideGateHint();   // 开关切换:隐藏残留提示
+      renderSanitizeBtn();
+      v2Toast(devSG.checked ? "在线 API 账号安全已开启:⚠️标记条目等同关闭" : "在线 API 账号安全已关闭:⚠️条目恢复原设置", devSG.checked ? "ok" : "err");
+    };
+  }
   // 词库管理:转化入口
   const ruleBuild = el("ruleBuild");
   if(ruleBuild) ruleBuild.onclick = buildUserRule;
@@ -1983,6 +2015,7 @@ async function renderUniCands(box, u){
         if(!b2.includes(id)){
           u.worldBookIds = b2.concat(id);
           await saveUniverse(u);
+          await loadWorldBook(id).catch(()=>null);   // 修问题2:绑定后立即入缓存(否则要刷新页面才注入)
           await loadUniverses();
         }
         await renderUniInfoPop();
@@ -2005,7 +2038,6 @@ async function gotoWbEditor(wbid){
   v2Toast("已打开 WorldBook 编辑", "ok");
 }
 
-/* 移动端浮层:页面菜单(汉堡) + 模型选择 */
 /* 移动端:点击正文区收回打开的抽屉(左世界浏览器/右设定池) - 下意识操作 */
 function bindDismissDrawers(){
   document.addEventListener("pointerdown", (e)=>{
@@ -2019,6 +2051,7 @@ function bindDismissDrawers(){
     if(closed) e.preventDefault();   // 本次点击只收抽屉,不唤起输入法
   }, true);
 }
+/* 移动端浮层:页面菜单(汉堡) + 模型选择 */
 function bindMobPopups(){
   const navBtn = el("mobNavBtn"), navPop = el("mobNavPop"), mBtn = el("mobModelBtn"), mPop = el("mobModelPop");
   if(navBtn && navPop){
@@ -2148,8 +2181,8 @@ function mobLayout(){
 async function init(){
   applyFontScale(state.cfg.fontScale || 1);
   mobLayout();
-  bindMobPopups();
   bindDismissDrawers();
+  bindMobPopups();
   bindWmTabs();
   updateMobPageTitle();
   window.addEventListener("resize", ()=>{ mobLayout(); });
@@ -2369,6 +2402,19 @@ async function importWorldBook(stJson){ const r = await apiV2("POST", "/api/worl
 // ---- 全局激活 ----
 async function loadGlobal(){ const g = await apiV2("GET", "/api/global"); V2.globalActiveWB = (g && g.globalActiveWB) || []; V2_GLOBAL_ACTIVE = new Set(V2.globalActiveWB); return V2.globalActiveWB; }
 async function saveGlobal(){ await apiV2("PUT", "/api/global", { globalActiveWB: V2.globalActiveWB || [] }); }
+
+/* 预热"激活世界书":注入(computeActiveEntries)只读 V2.wbCache,而启动/绑定时并不会自动拉详情 →
+ * 全局激活 ⊕ 当前宇宙绑定的世界书若不在缓存里,就出现"刷新后不注入 / 名字显示成文件ID / 点一下才恢复"。
+ * 统一在"用之前"补齐缓存(幂等,缺失才拉)。 */
+async function ensureActiveWbsLoaded(){
+  const ids = [];
+  const push = id => { if(id && !ids.includes(id)) ids.push(id); };
+  (V2.globalActiveWB || []).forEach(push);
+  if(V2.curUniverse && Array.isArray(V2.curUniverse.worldBookIds)) V2.curUniverse.worldBookIds.forEach(push);
+  const miss = ids.filter(id => !(V2.wbCache && V2.wbCache[id]));
+  if(!miss.length) return;                                   // 全部已缓存 → 零开销
+  await Promise.all(miss.map(id => loadWorldBook(id).catch(()=>null)));
+}
 
 // ---- 激活解析(全局 ∪ 宇宙,服务端并集) ----
 async function apiResolve(universeId){
@@ -3405,16 +3451,51 @@ async function onSelectWork(id){
   renderWorldBrowser();  // 切换作品集后立即刷新左侧树,避免显示上一作品集的目录
   saveLastNav();
 }
+/* 章节 404 自我修复:点击的章节文件不存在(被删除/网盘同步回滚)时,
+ * 从本地列表/缓存/作品 chapterIds 中剔除,并自动选中下一个可用章节,
+ * 避免反复 404 且"点击无反应"。网络错误(非 404)不剔除,仅提示。 */
 async function onSelectChapter(id){
   V2.selection.chapter = id;
   if(!V2.curWork) return;
-  const ch = await loadChapter(V2.curWork.id, id).catch(()=>null);
-  if(ch){
-    const ta = el("editor");
-    if(ta && ta.value !== (ch.body||"")){ ta.value = ch.body || ""; }
-    el("charCount").textContent = ((ch.body)||"").length + " 字";
-    const nm = el("curName"); if(nm) nm.value = ch.title || "";
+  const ch = await loadChapter(V2.curWork.id, id)
+    .catch(e=>{ if(/API 404/.test((e && e.message) || "")) return null; throw e; })
+    .catch(()=>{ v2Toast("章节加载失败(网络/服务异常),请重试", "err"); return null; });
+  if(!ch){
+    // 404:该章节文件在服务端已不存在 → 从各缓存剔除,避免死循环
+    const dead = id;
+    V2.workChapters = (V2.workChapters||[]).filter(c=>c.id !== dead);
+    if(V2.chaptersCache && V2.chaptersCache[V2.curWork.id]){
+      V2.chaptersCache[V2.curWork.id] = V2.chaptersCache[V2.curWork.id].filter(c=>c.id !== dead);
+    }
+    if(Array.isArray(V2.curWork.chapterIds)){
+      V2.curWork.chapterIds = V2.curWork.chapterIds.filter(c=>c !== dead);
+    }
+    const next = (V2.workChapters||[])[0] || null;
+    V2.selection.chapter = next ? next.id : null;
+    const ta = el("editor"), nm = el("curName");
+    if(next){
+      const ch2 = await loadChapter(V2.curWork.id, next.id).catch(()=>null);
+      if(ch2){
+        if(ta && ta.value !== (ch2.body||"")){ ta.value = ch2.body || ""; }
+        el("charCount").textContent = ((ch2.body)||"").length + " 字";
+        if(nm) nm.value = ch2.title || "";
+      }
+    } else {
+      if(ta) ta.value = "";
+      el("charCount").textContent = "0 字";
+      if(nm) nm.value = "";
+    }
+    renderWorldSettings();
+    renderV2ChapterBar();
+    renderWorldBrowser();
+    saveLastNav();
+    v2Toast("章节文件不存在(可能已被删除或同步回滚),已自动从列表移除", "err");
+    return;
   }
+  const ta = el("editor");
+  if(ta && ta.value !== (ch.body||"")){ ta.value = ch.body || ""; }
+  el("charCount").textContent = ((ch.body)||"").length + " 字";
+  const nm = el("curName"); if(nm) nm.value = ch.title || "";
   renderWorldSettings();
   renderV2ChapterBar();
   saveLastNav();
@@ -3613,6 +3694,7 @@ function renderV2GlobalSheet(){
         if(!(V2.globalActiveWB||[]).includes(id)){
           V2.globalActiveWB = (V2.globalActiveWB||[]).concat(id);
           await saveGlobal();
+          await loadWorldBook(id).catch(()=>null);   // 修问题1:激活后立即入缓存(否则名字显示文件ID)
         }
         renderV2GlobalSheet();
       };
@@ -3736,6 +3818,7 @@ async function initV2(){
         if(wantCh) await onSelectChapter(wantCh);
       }
     }
+    await ensureActiveWbsLoaded();   // 修问题1:预热全局+宇宙激活世界书(否则刷新后不注入/名字显示文件ID)
     renderWorldBrowser();
     renderV2UniverseBar();
     renderV2WorkBar();
@@ -4104,6 +4187,6 @@ if(el("v2NewWorldSB")) el("v2NewWorldSB").onclick = v2NewWorld;  // 世界浏览
   });
 }
 
-window.__v2 = { V2, computeActiveEntries, v2EntriesIfActive, loadUniverses, loadUniverse, loadWorks, loadWork, loadWorldBooks, loadWorldBook, renderWorldBrowser, renderWorldSettings, onSelectUniverse, onSelectWork, onSelectChapter, renderWorldManager, openWorldManager, migrateLegacyToV2 };
+window.__v2 = { V2, computeActiveEntries, v2EntriesIfActive, ensureActiveWbsLoaded, loadGlobal, loadUniverses, loadUniverse, loadWorks, loadWork, loadWorldBooks, loadWorldBook, renderWorldBrowser, renderWorldSettings, onSelectUniverse, onSelectWork, onSelectChapter, renderWorldManager, openWorldManager, migrateLegacyToV2 };
 
 document.addEventListener("DOMContentLoaded", init);

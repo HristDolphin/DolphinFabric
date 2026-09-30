@@ -178,17 +178,16 @@
       <div><button id="ruleBuild" class="mini-btn">转化并启用</button></div>
     </div>
 
-    <!-- 开发者设置已隐藏(发布版): 在线过滤默认开启不可关闭
-        <div class="prompt-head dev-head" style="margin-top:10px">
-          <strong>开发者设置</strong>
-        </div>
-        <div class="dev-settings">
-          <label class="dev-setting">
-            <input type="checkbox" id="devSafeGate">
-            <span><b>在线过滤（SafeGate）</b><br><small>关闭后，在线模式下 ⚠️标记条目不再等同关闭（恢复原设置）；已存在的红框标记仍会在 UI 显示</small></span>
-          </label>
-        </div>
-    -->
+    <!-- 开发者设置（第三栏：在线 API 账号安全开关） -->
+    <div class="prompt-head dev-head" style="margin-top:10px">
+      <strong>开发者设置</strong>
+    </div>
+    <div class="dev-settings">
+      <label class="dev-setting">
+        <input type="checkbox" id="devAcctSafety">
+        <span><b>在线 API 账号安全</b><br><small>默认开启。开启时，在线模式下 ⚠️ 标记的条目等同关闭，避免违规内容被发送到你自己的 API 账号；关闭后恢复原设置（已存在的红框标记仍会在 UI 显示）</small></span>
+      </label>
+    </div>
   </div>
 
   <!-- 参数面板（弹窗，由 🎚 拉起） -->
@@ -327,7 +326,7 @@
       <div class="editor-body">
         <textarea id="editor" placeholder="把前文贴进来，点「续写」或按 Ctrl+Enter。新内容会追加在末尾。"></textarea>
         <div id="gateHint" class="gate-hint" style="display:none"></div>
-        <!-- 新用户引导:未选择章节时纯色遮挡正文区,引导创建流程 -->
+<!-- 新用户引导:未选择章节时纯色遮挡正文区,引导创建流程 -->
         <div id="guideOverlay" class="guide-overlay" style="display:none">
           <div class="guide-card">
             <div class="guide-title">欢迎使用续写台</div>

@@ -8,29 +8,32 @@ rules/user/
 tools/raw_dicts/
 tools/*.txt
 
+# ── 用户数据（红线：不得入库、不得被 git clean 清理）──
+Universes/
+works/
+WorldBook/
+worlds/
+lorebooks/
+_index.json
+_global.json
+
+# ── 发布产物(打包 zip / apk 等,不进代码库) ──
+新建文件夹/
+
+# ── 开发备份与临时 ──
+续写台/archives/
+_backup_*/
+_trash/
+*.tmp
+*.bak_*
+serve.py.bak_*
+*.before
+
 # Python
 __pycache__/
 *.pyc
 
-# 备份与临时
-_backup_*/
-
 servercfg.json
-
-# 开发备份(不入库)
-续写台/archives/
-
-# 运行数据(启动时自动重建,不入库)
-_index.json
-_global.json
-Universes/
-works/
-WorldBook/
-lorebooks/
 
 # 用户预设(系统提示词/风格预设等,含个人内容,不入库)
 prefs.json
-
-# 开发备份文件(不入库)
-*.bak_*
-serve.py.bak_*

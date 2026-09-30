@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 续写工作台 · 后端（重构版 Phase 1 数据层）
@@ -22,7 +22,10 @@ W_DIR    = os.path.join(BASE_DIR, "works")
 INDEX_F  = os.path.join(BASE_DIR, "_index.json")
 GLOBAL_F = os.path.join(BASE_DIR, "_global.json")
 SCFG_F = os.path.join(BASE_DIR, "servercfg.json")  # 服务端配置:在线 Base/Ollama(不再存密钥,不入 git)
-PREF_F = os.path.join(BASE_DIR, "prefs.json")      # 用户预设(系统提示词/风格预设/参数/提示词条目);不含任何密钥
+PREF_F = os.path.join(BASE_DIR, "prefs.json")
+# prefs.json 读-改-写锁:ThreadingHTTPServer 会并发处理请求,不加锁时
+# "单条提交"与"全量推送"交错会互相覆盖(丢更新,表现为服务器风格预设被覆盖)。
+_PREFS_LOCK = threading.Lock()      # 用户预设(系统提示词/风格预设/参数/提示词条目);不含任何密钥
 LORE_F = os.path.join(BASE_DIR, u"续写台", "lorebooks", "packs.json")  # 设定包(前端 packs)服务端落盘点
 
 def load_servercfg():
@@ -39,8 +42,7 @@ def load_servercfg():
 def save_servercfg(cfg):
     cfg = dict(cfg or {})
     cfg.pop("onlineKey", None)   # 双保险:任何调用都写不进密钥
-    with open(SCFG_F, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=1)
+    atomic_write(SCFG_F, cfg)    # 原子写:避免写入中途崩溃留下半个配置文件
 
 # ---- 用户预设(服务端落盘) ----
 # 为什么:系统提示词/风格预设等原先只存浏览器 localStorage,而 localStorage 按 origin(协议+主机+端口)
@@ -100,24 +102,145 @@ def ensure_dirs():
         os.makedirs(d, exist_ok=True)
 
 def slurp(path, default=None):
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return default
+    """读 JSON。因写盘改为原子替换,Windows 下替换的瞬间目标文件可能短暂不可读
+    （PermissionError: 文件被占用），故对 PermissionError 做几次短重试；
+    文件不存在或内容真损坏时仍返回 default（保持原语义）。"""
+    delay = 0.02
+    for attempt in range(5):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except PermissionError:
+            if attempt == 4:
+                return default
+            time.sleep(delay)
+            delay = min(delay * 1.6, 0.15)
+        except Exception:
+            return default
+    return default
 
-def dump(path, obj):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
+def atomic_write(path, obj):
+    """原子写 JSON：同目录写 .tmp → flush + fsync → os.replace 覆盖目标。
+
+    为什么必须原子：原实现以 open(path,"w") 直接截断目标再写入，进程崩溃/断电会留下
+    半个 JSON；而 slurp() 读失败会静默返回默认值，用户下次保存就把默认值写回磁盘 ——
+    数据被永久覆盖且无从察觉。os.replace 在 POSIX 与 Windows 上均为原子替换，
+    因此目标文件要么是旧的完整内容、要么是新的完整内容，不存在中间态。
+    """
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())    # 先把 .tmp 落盘,再原子替换,避免断电拿到空/半文件
+    # Windows 上若目标文件此刻正被其他线程/进程打开,os.replace 会抛 PermissionError;
+    # ThreadingHTTPServer 是并发模型,读-改-写重叠是常态,故做指数退避重试(累计约 1.2s)。
+    delay = 0.02
+    for attempt in range(12):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt == 11:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 1.6, 0.15)
+
+
+# 兼容保留旧名：项目中所有 dump(...) 调用点即为原子写
+dump = atomic_write
+
+# ---------------- 路径安全（防路径穿越） ----------------
+# 背景：所有 /api/<实体>/<id> 路由都把 URL 片段 unquote() 后拼进 os.path.join。
+# 攻击者可用 %2F 编码斜杠绕过 r"^/api/works/([^/]+)$"（%2F 不是 "/"，正则放行），
+# unquote 后还原成分隔符并跳出数据目录；最严重者为
+#   DELETE /api/works/..%2F..%2F..  → os.path.isdir() 为真 → shutil.rmtree 删除任意目录。
+# 本文件采用三道防线：
+#   ① HTTP 层 ID 白名单（非法 → 400）
+#   ② 拼路径后 realpath 前缀校验（兜底，越界 → 抛 ValueError）
+#   ③ 作品集删除改为移入回收站 _trash/（保留 7 天），不再直接 rmtree
+_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def is_valid_id(s):
+    """数据实体 id 白名单：仅字母/数字/下划线/连字符（与实际 id 形态一致，如 wb_1790267900403）。"""
+    return isinstance(s, str) and bool(_ID_RE.match(s))
+
+
+def _safe_join(root, *parts):
+    """在 root 下安全拼接路径：realpath 归一后必须仍位于 root 之内，否则抛 ValueError。
+    用 os.sep 后缀比较，避免 /data 与 /data-evil 这类前缀误判；normcase 兼容 Windows 盘符大小写。"""
+    root_r = os.path.realpath(root)
+    p = os.path.realpath(os.path.join(root_r, *parts))
+    rn = os.path.normcase(root_r)
+    pn = os.path.normcase(p)
+    if pn != rn and not pn.startswith(rn + os.sep):
+        raise ValueError("path escapes data root: %r" % (p,))
+    return p
+
+
+# ---------------- 回收站（删除作品集不再 rmtree） ----------------
+TRASH_DIR = os.path.join(BASE_DIR, "_trash")
+TRASH_KEEP_DAYS = 7
+
+
+def _move_to_trash(path):
+    """把目录整体移入 _trash/<时间戳>/<原名>，保留 7 天，返回落地路径。
+    绝不直接 shutil.rmtree：误删可由用户手工从 _trash 取回。同秒重名自动加后缀。"""
+    name = os.path.basename(os.path.normpath(path)) or "item"
+    dest_dir = os.path.join(TRASH_DIR, time.strftime("%Y%m%d-%H%M%S"))
+    os.makedirs(dest_dir, exist_ok=True)
+    dest = os.path.join(dest_dir, name)
+    n = 1
+    while os.path.exists(dest):
+        dest = os.path.join(dest_dir, "%s__%d" % (name, n))
+        n += 1
+    shutil.move(path, dest)
+    return dest
+
+
+def purge_trash(days=TRASH_KEEP_DAYS):
+    """启动时清理 _trash 中超过 days 天的条目，返回被清理的条目名列表（幂等）。"""
+    if not os.path.isdir(TRASH_DIR):
+        return []
+    cutoff = time.time() - days * 86400
+    removed = []
+    for name in os.listdir(TRASH_DIR):
+        p = os.path.join(TRASH_DIR, name)
+        try:
+            if os.path.getmtime(p) < cutoff:
+                shutil.rmtree(p, ignore_errors=True)
+                if not os.path.exists(p):
+                    removed.append(name)
+        except Exception:
+            pass
+    return removed
 
 # ---------------- 索引重建 ----------------
+def _is_sync_conflict(fn):
+    """网盘同步冲突副本(wb_xxx_冲突文件_Heres_xxx.json 等)不是独立世界书,列表/索引一律忽略。
+    (否则同一本书会被当成两本,列表重复显示。)"""
+    if "_冲突文件_" in fn or "_冲突文件" in fn:
+        return True
+    return re.search(r"(?i)_(conflict|conflicted)[-_0-9]", fn) is not None
+
+_INDEX_LOCK = threading.Lock()   # 索引「读-改-写」与全量重建互斥:防并发互相覆盖/写坏
+
+
 def rebuild_index():
-    """扫描 WorldBook / Universes / works，重建 _index.json（不含状态）。"""
+    """扫描 WorldBook / Universes / works，重建 _index.json（不含状态）。加锁。"""
+    with _INDEX_LOCK:
+        return _rebuild_index_locked()
+
+
+def _rebuild_index_locked():
+    """不加锁的实际重建逻辑。调用方必须已持有 _INDEX_LOCK。"""
     world_books = []
     if os.path.isdir(WB_DIR):
         for fn in os.listdir(WB_DIR):
-            if fn.endswith(".json"):
+            if fn.endswith(".json") and not _is_sync_conflict(fn):
                 wb = slurp(os.path.join(WB_DIR, fn))
                 if isinstance(wb, dict) and "id" in wb:
                     world_books.append({
@@ -151,8 +274,29 @@ def rebuild_index():
                         "chapterIds": w.get("chapterIds", []),
                     }
     index = {"worldBooks": world_books, "universes": universes, "works": works}
-    dump(INDEX_F, index)
+    atomic_write(INDEX_F, index)
     return index
+
+
+def update_index_work(w_id, w_obj):
+    """增量更新 _index.json 中单个作品的条目(name / universeId / chapterIds)。
+
+    原实现每保存一个章节都要全量重扫 WorldBook / Universes / works 三个目录，
+    且 put_chapter → put_work → rebuild_index 会**连做两次**全量重建（数据量大时明显卡顿）。
+    现在只改索引里对应的一个作品条目并原子写回；索引缺失/结构异常时回退全量重建兜底。
+    """
+    with _INDEX_LOCK:
+        idx = slurp(INDEX_F, None)
+        if not isinstance(idx, dict) or not isinstance(idx.get("works"), dict):
+            return _rebuild_index_locked()
+        idx["works"][w_id] = {
+            "id": w_id,
+            "name": w_obj.get("name", w_id),
+            "universeId": w_obj.get("universeId", ""),
+            "chapterIds": list(w_obj.get("chapterIds") or []),
+        }
+        atomic_write(INDEX_F, idx)
+        return idx
 
 def load_global():
     g = slurp(GLOBAL_F, None)
@@ -175,7 +319,7 @@ def clean_indexes():
     valid_wb = set()
     if os.path.isdir(WB_DIR):
         for fn in os.listdir(WB_DIR):
-            if fn.endswith(".json"):
+            if fn.endswith(".json") and not _is_sync_conflict(fn):
                 wb = slurp(os.path.join(WB_DIR, fn))
                 if isinstance(wb, dict) and wb.get("id"):
                     valid_wb.add(wb["id"])
@@ -453,17 +597,21 @@ def build_user_rule(cat, label, words):
 
 # ---------------- 世界书（SillyTavern 规范）----------------
 def list_worldbooks():
-    return [f[:-5] for f in os.listdir(WB_DIR) if f.endswith(".json")] if os.path.isdir(WB_DIR) else []
+    return [f[:-5] for f in os.listdir(WB_DIR)
+            if f.endswith(".json") and not _is_sync_conflict(f)] if os.path.isdir(WB_DIR) else []
 
 def get_worldbook(wb_id):
-    return slurp(os.path.join(WB_DIR, wb_id + ".json"))
+    try:
+        return slurp(_safe_join(WB_DIR, wb_id + ".json"))
+    except ValueError:
+        return None
 
 def put_worldbook(wb_id, obj):
     """原样直存 ST 世界书（保留 entries 字典等全部字段）。"""
     if not isinstance(obj, dict):
         obj = {"id": wb_id, "name": wb_id, "entries": {}}
     obj["id"] = wb_id
-    dump(os.path.join(WB_DIR, wb_id + ".json"), obj)
+    dump(_safe_join(WB_DIR, wb_id + ".json"), obj)
     rebuild_index()
     return obj
 
@@ -491,7 +639,7 @@ def import_st_worldbook(raw):
         "extensions": raw.get("extensions", {}),
         "entries": entries,
     }
-    dump(os.path.join(WB_DIR, wb_id + ".json"), wb)
+    dump(_safe_join(WB_DIR, wb_id + ".json"), wb)
     rebuild_index()
     return wb
 
@@ -503,7 +651,13 @@ def _filter_existing_wb(ids):
     out = []
     for i in ids:
         i = str(i)
-        if os.path.isfile(os.path.join(WB_DIR, i + ".json")) and i not in out:
+        if not is_valid_id(i) or i in out:
+            continue
+        try:
+            exists = os.path.isfile(_safe_join(WB_DIR, i + ".json"))
+        except ValueError:
+            continue
+        if exists:
             out.append(i)
     return out
 
@@ -520,7 +674,10 @@ def list_universes():
     return out
 
 def get_universe(u_id):
-    p = os.path.join(U_DIR, u_id + "Universes.json")
+    try:
+        p = _safe_join(U_DIR, u_id + "Universes.json")
+    except ValueError:
+        return None
     u = slurp(p)
     if isinstance(u, dict):
         u["worldBookIds"] = _filter_existing_wb(u.get("worldBookIds", []))
@@ -531,12 +688,15 @@ def put_universe(u_id, obj):
         obj = {"id": u_id, "name": u_id, "worldBookIds": []}
     obj["id"] = u_id
     obj.setdefault("worldBookIds", [])
-    dump(os.path.join(U_DIR, u_id + "Universes.json"), obj)
+    dump(_safe_join(U_DIR, u_id + "Universes.json"), obj)
     rebuild_index()
     return obj
 
 def delete_universe(u_id):
-    p = os.path.join(U_DIR, u_id + "Universes.json")
+    try:
+        p = _safe_join(U_DIR, u_id + "Universes.json")
+    except ValueError:
+        return
     if os.path.isfile(p):
         os.remove(p)
     rebuild_index()
@@ -552,7 +712,10 @@ def list_works():
     return out
 
 def get_work(w_id):
-    return slurp(os.path.join(W_DIR, w_id, w_id + "works.json"))
+    try:
+        return slurp(_safe_join(W_DIR, w_id, w_id + "works.json"))
+    except ValueError:
+        return None
 
 def put_work(w_id, obj):
     if not isinstance(obj, dict):
@@ -560,18 +723,25 @@ def put_work(w_id, obj):
     obj["id"] = w_id
     obj.setdefault("universeId", "")
     obj.setdefault("chapterIds", [])
-    dump(os.path.join(W_DIR, w_id, w_id + "works.json"), obj)
-    rebuild_index()
+    atomic_write(_safe_join(W_DIR, w_id, w_id + "works.json"), obj)
+    update_index_work(w_id, obj)      # 增量更新索引（不再全量重扫三个目录）
     return obj
 
 def delete_work(w_id):
-    p = os.path.join(W_DIR, w_id)
+    """删除作品集：移入回收站（_trash/<时间戳>/，保留 7 天），不再直接 shutil.rmtree。"""
+    try:
+        p = _safe_join(W_DIR, w_id)
+    except ValueError:
+        return
     if os.path.isdir(p):
-        shutil.rmtree(p)
+        _move_to_trash(p)
     rebuild_index()
 
 def get_chapter(w_id, c_id):
-    return slurp(os.path.join(W_DIR, w_id, "chapters", c_id + ".json"))
+    try:
+        return slurp(_safe_join(W_DIR, w_id, "chapters", c_id + ".json"))
+    except ValueError:
+        return None
 
 def put_chapter(w_id, c_id, obj):
     if not isinstance(obj, dict):
@@ -580,22 +750,27 @@ def put_chapter(w_id, c_id, obj):
     obj.setdefault("tags", [])
     obj.setdefault("body", "")
     obj.setdefault("disabledEntryIds", [])
-    dump(os.path.join(W_DIR, w_id, "chapters", c_id + ".json"), obj)
-    # 同步作品目录的 chapterIds
+    atomic_write(_safe_join(W_DIR, w_id, "chapters", c_id + ".json"), obj)
+    # 同步作品目录的 chapterIds：直接写作品文件 + 索引增量更新（避免全量重建两次）
     w = get_work(w_id) or {"id": w_id, "name": w_id, "universeId": "", "chapterIds": []}
     if c_id not in w["chapterIds"]:
         w["chapterIds"].append(c_id)
-        put_work(w_id, w)
+        atomic_write(_safe_join(W_DIR, w_id, w_id + "works.json"), w)
+        update_index_work(w_id, w)
     return obj
 
 def delete_chapter(w_id, c_id):
-    p = os.path.join(W_DIR, w_id, "chapters", c_id + ".json")
+    try:
+        p = _safe_join(W_DIR, w_id, "chapters", c_id + ".json")
+    except ValueError:
+        return
     if os.path.isfile(p):
         os.remove(p)
     w = get_work(w_id)
     if w and c_id in w["chapterIds"]:
         w["chapterIds"].remove(c_id)
-        put_work(w_id, w)
+        atomic_write(_safe_join(W_DIR, w_id, w_id + "works.json"), w)
+        update_index_work(w_id, w)
 
 # ---------------- 激活解析 ----------------
 def resolve_active_worldbooks(universe_id):
@@ -741,36 +916,51 @@ class Handler(SimpleHTTPRequestHandler):
             return {}
         return json.loads(self.rfile.read(n).decode("utf-8"))
 
+    def _id_or_error(self, raw):
+        """URL 片段 → 校验后的 id。设计要点：必须 unquote 之后再校验
+        （正则匹配的是未解码的 path，%2F 会绕过 [^/]+）。非法直接回 400 并返回 None。"""
+        s = unquote(raw)
+        if not is_valid_id(s):
+            self._send_json({"error": "invalid id"}, 400)
+            return None
+        return s
+
     def _prefs_item(self, body):
         """需求4:单条提交 —— 把浏览器本地某一条预设 upsert 进服务端 prefs.json(仅单条,不提供批量)"""
         if not isinstance(body, dict):
             return self._send_json({"error": "bad body"}, 400)
         field = body.get("field")
-        cur = load_prefs()
-        if field == "sysPrompt":
-            val = body.get("value")
-            if not isinstance(val, str):
-                return self._send_json({"error": "value must be string"}, 400)
-            cur["sysPrompt"] = val
-        elif field in ("styles", "promptItems"):
-            item = body.get("item")
-            if not isinstance(item, dict) or not item.get("id"):
-                return self._send_json({"error": "item.id required"}, 400)
-            arr = cur.get(field)
-            if not isinstance(arr, list):
-                arr = []
-            arr = [x for x in arr if not (isinstance(x, dict) and x.get("id") == item.get("id"))]
-            arr.append(item)
-            cur[field] = arr
-        else:
+        if field not in ("sysPrompt", "styles", "promptItems"):
             return self._send_json({"error": "unsupported field: %s" % field}, 400)
-        return self._send_json(save_prefs(cur), 200)
+        with _PREFS_LOCK:                     # 读-改-写串行,避免与并发全量推送互相覆盖
+            cur = load_prefs()
+            if field == "sysPrompt":
+                val = body.get("value")
+                if not isinstance(val, str):
+                    return self._send_json({"error": "value must be string"}, 400)
+                cur["sysPrompt"] = val
+            else:
+                item = body.get("item")
+                if not isinstance(item, dict) or not item.get("id"):
+                    return self._send_json({"error": "item.id required"}, 400)
+                arr = cur.get(field)
+                if not isinstance(arr, list):
+                    arr = []
+                arr = [x for x in arr if not (isinstance(x, dict) and x.get("id") == item.get("id"))]
+                arr.append(item)
+                cur[field] = arr
+            return self._send_json(save_prefs(cur), 200)
 
     def do_GET(self):
         p = urlparse(self.path).path
         # 重构后 API
         if p == "/api/index":
-            return self._send_json(rebuild_index())
+            # GET 只读：不再有副作用（原实现会顺手全量重建并写盘）。
+            # 需要主动重建请调用 POST /api/reindex。
+            idx = slurp(INDEX_F, None)
+            if not isinstance(idx, dict):
+                idx = {"worldBooks": [], "universes": {}, "works": {}}
+            return self._send_json(idx)
         if p == "/api/global":
             return self._send_json(load_global())
         if p == "/api/safegate":
@@ -779,7 +969,10 @@ class Handler(SimpleHTTPRequestHandler):
             return self._send_json({"worldBooks": [get_worldbook(i) for i in list_worldbooks()]})
         m = re.match(r"^/api/worldbooks/([^/]+)$", p)
         if m:
-            wb = get_worldbook(unquote(m.group(1)))
+            wb_id = self._id_or_error(m.group(1))
+            if wb_id is None:
+                return
+            wb = get_worldbook(wb_id)
             return self._send_json(wb, 200 if wb else 404)
         if p == "/api/servercfg":
             # 只回传地址类配置;密钥永不出服务端(服务端也已不再持有)
@@ -800,26 +993,42 @@ class Handler(SimpleHTTPRequestHandler):
             return self._send_json({"universes": list_universes()})
         m = re.match(r"^/api/universes/([^/]+)$", p)
         if m:
-            u = get_universe(unquote(m.group(1)))
+            u_id = self._id_or_error(m.group(1))
+            if u_id is None:
+                return
+            u = get_universe(u_id)
             return self._send_json(u, 200 if u else 404)
         if p == "/api/works":
             return self._send_json({"works": list_works()})
         m = re.match(r"^/api/works/([^/]+)$", p)
         if m:
-            w = get_work(unquote(m.group(1)))
+            w_id = self._id_or_error(m.group(1))
+            if w_id is None:
+                return
+            w = get_work(w_id)
             return self._send_json(w, 200 if w else 404)
         m = re.match(r"^/api/works/([^/]+)/chapters$", p)
         if m:
-            w_id = unquote(m.group(1))
+            w_id = self._id_or_error(m.group(1))
+            if w_id is None:
+                return
             w = get_work(w_id) or {"chapterIds": []}
             chapters = [get_chapter(w_id, c) for c in w["chapterIds"]]
             return self._send_json({"chapters": [c for c in chapters if c]})
         m = re.match(r"^/api/works/([^/]+)/chapters/([^/]+)$", p)
         if m:
-            c = get_chapter(unquote(m.group(1)), unquote(m.group(2)))
+            w_id = self._id_or_error(m.group(1))
+            if w_id is None:
+                return
+            c_id = self._id_or_error(m.group(2))
+            if c_id is None:
+                return
+            c = get_chapter(w_id, c_id)
             return self._send_json(c, 200 if c else 404)
         if p == "/api/resolve":
             u = self.headers.get("X-Universe", "")
+            if not is_valid_id(u):
+                u = ""          # 非法宇宙 id 一律按"无宇宙"处理(仍返回全局激活),不参与路径拼接
             wb_ids = resolve_active_worldbooks(u)
             payload = {"activeWorldBookIds": wb_ids,
                        "worldBooks": [assemble_worldbook(i) for i in wb_ids if get_worldbook(i)]}
@@ -857,19 +1066,34 @@ class Handler(SimpleHTTPRequestHandler):
         body = self._body_json()
         m = re.match(r"^/api/worldbooks/([^/]+)$", p)
         if m:
-            wb = put_worldbook(unquote(m.group(1)), body)
+            wb_id = self._id_or_error(m.group(1))
+            if wb_id is None:
+                return
+            wb = put_worldbook(wb_id, body)
             return self._send_json(wb, 200)
         m = re.match(r"^/api/universes/([^/]+)$", p)
         if m:
-            u = put_universe(unquote(m.group(1)), body)
+            u_id = self._id_or_error(m.group(1))
+            if u_id is None:
+                return
+            u = put_universe(u_id, body)
             return self._send_json(u, 200)
         m = re.match(r"^/api/works/([^/]+)$", p)
         if m:
-            w = put_work(unquote(m.group(1)), body)
+            w_id = self._id_or_error(m.group(1))
+            if w_id is None:
+                return
+            w = put_work(w_id, body)
             return self._send_json(w, 200)
         m = re.match(r"^/api/works/([^/]+)/chapters/([^/]+)$", p)
         if m:
-            c = put_chapter(unquote(m.group(1)), unquote(m.group(2)), body)
+            w_id = self._id_or_error(m.group(1))
+            if w_id is None:
+                return
+            c_id = self._id_or_error(m.group(2))
+            if c_id is None:
+                return
+            c = put_chapter(w_id, c_id, body)
             return self._send_json(c, 200)
         if p == "/api/servercfg":
             sc = load_servercfg()
@@ -880,11 +1104,13 @@ class Handler(SimpleHTTPRequestHandler):
             return self._send_json({"ok": True})
         if p == "/api/prefs":
             # 乐观并发校验:客户端带 expectedUpdatedAt 且与服务端不一致 → 409(服务端权威,不被覆盖)
-            cur = load_prefs()
-            exp = body.get("expectedUpdatedAt") if isinstance(body, dict) else None
-            if exp is not None and cur.get("updatedAt") and int(exp) != int(cur.get("updatedAt")):
-                return self._send_json({"error": "stale", "serverUpdatedAt": cur.get("updatedAt"), "prefs": cur}, 409)
-            return self._send_json(save_prefs(body), 200)
+            # 校验与写入必须在同一临界区内(否则并发"单条提交"可在校验后、写入前插入 → 通过校验仍丢更新)
+            with _PREFS_LOCK:
+                cur = load_prefs()
+                exp = body.get("expectedUpdatedAt") if isinstance(body, dict) else None
+                if exp is not None and cur.get("updatedAt") and int(exp) != int(cur.get("updatedAt")):
+                    return self._send_json({"error": "stale", "serverUpdatedAt": cur.get("updatedAt"), "prefs": cur}, 409)
+                return self._send_json(save_prefs(body), 200)
         if p == "/api/global":
             g = body if isinstance(body, dict) else {}
             g.setdefault("globalActiveWB", [])
@@ -900,23 +1126,40 @@ class Handler(SimpleHTTPRequestHandler):
         p = urlparse(self.path).path
         m = re.match(r"^/api/worldbooks/([^/]+)$", p)
         if m:
-            wb_id = unquote(m.group(1))
-            fp = os.path.join(WB_DIR, wb_id + ".json")
+            wb_id = self._id_or_error(m.group(1))
+            if wb_id is None:
+                return
+            try:
+                fp = _safe_join(WB_DIR, wb_id + ".json")
+            except ValueError:
+                return self._send_json({"error": "forbidden"}, 403)
             if os.path.isfile(fp):
                 os.remove(fp); rebuild_index()
                 return self._send_json({"ok": True})
             return self._send_json({"ok": False}, 404)
         m = re.match(r"^/api/universes/([^/]+)$", p)
         if m:
-            delete_universe(unquote(m.group(1)))
+            u_id = self._id_or_error(m.group(1))
+            if u_id is None:
+                return
+            delete_universe(u_id)
             return self._send_json({"ok": True})
         m = re.match(r"^/api/works/([^/]+)$", p)
         if m:
-            delete_work(unquote(m.group(1)))
+            w_id = self._id_or_error(m.group(1))
+            if w_id is None:
+                return
+            delete_work(w_id)
             return self._send_json({"ok": True})
         m = re.match(r"^/api/works/([^/]+)/chapters/([^/]+)$", p)
         if m:
-            delete_chapter(unquote(m.group(1)), unquote(m.group(2)))
+            w_id = self._id_or_error(m.group(1))
+            if w_id is None:
+                return
+            c_id = self._id_or_error(m.group(2))
+            if c_id is None:
+                return
+            delete_chapter(w_id, c_id)
             return self._send_json({"ok": True})
         self._send_json({"error": "unknown DELETE " + p}, 405)
 
@@ -925,7 +1168,7 @@ class Handler(SimpleHTTPRequestHandler):
 #     不在多处硬编码;改文件即生效,无需改代码。
 #     /api/ping 与 UDP 应答都会下发,供 D4C 读取(A1)。
 PC_VERSION_FILE = os.path.join(BASE_DIR, "version.json")
-PC_VERSION_FALLBACK = "26.67.9"          # 文件缺失/损坏时的兜底,与仓库 version.json 保持一致
+PC_VERSION_FALLBACK = "26.67.10"         # 文件缺失/损坏时的兜底,与仓库 version.json 保持一致
 
 
 def pc_version():
@@ -1048,6 +1291,9 @@ def main():
     ensure_dirs()
     load_rules()
     rebuild_index()
+    _purged = purge_trash()          # 回收站保留期清理(启动时执行,幂等)
+    if _purged:
+        print("回收站清理: 已移除超过 %d 天的条目 %s" % (TRASH_KEEP_DAYS, _purged))
     _clean = clean_indexes()
     if _clean["universes"] or _clean["works"] or _clean["global"]:
         print("索引整理: 清理悬空引用", json.dumps(_clean, ensure_ascii=False))
