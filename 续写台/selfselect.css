@@ -1,0 +1,92 @@
+/* ============================================================================
+ * selfselect.css — 自绘选择器的视觉层
+ * 配套 selfselect.js 使用。删除本文件 + 对应 script 标签即可完整回退。
+ * ==========================================================================*/
+
+/* 覆盖层：与 textarea 可视区对齐，本身不吃事件（触摸由 document 捕获层处理） */
+.ss-layer {
+  position: absolute;
+  z-index: 3;                 /* 高于 #editor 的 z-index:1 */
+  pointer-events: none;       /* ★ 关键：不能挡触摸，否则手势全失效 */
+  overflow: hidden;
+}
+
+/* 单个行的选区色块 */
+.ss-rect {
+  position: absolute;
+  background: rgba(139, 124, 255, 0.34);
+  border-radius: 2px;
+  pointer-events: none;
+}
+
+/* 选区手柄：竖杆 + 圆点，用伪元素画圆点 */
+.ss-handle {
+  position: absolute;
+  width: 22px;
+  height: 22px;
+  margin-left: -11px;         /* 以杆为中心 */
+  pointer-events: none;       /* 命中判定在 JS 里用坐标算，不靠 DOM */
+  display: none;
+}
+.ss-handle::before {          /* 竖杆 */
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 0;
+  width: 2px;
+  height: 11px;
+  margin-left: -1px;
+  background: var(--accent, #8b7cff);
+  border-radius: 1px;
+}
+.ss-handle::after {           /* 圆点 */
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 10px;
+  width: 13px;
+  height: 13px;
+  margin-left: -6.5px;
+  border-radius: 50%;
+  background: var(--accent, #8b7cff);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.45);
+}
+
+/* 浮条：默认藏，选中后由 JS 显示 */
+.ss-bar {
+  position: absolute;
+  display: none;
+  align-items: center;
+  gap: 2px;
+  padding: 4px;
+  background: #21212e;
+  border: 1px solid #3a3a4e;
+  border-radius: 10px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.55);
+  pointer-events: auto;       /* ★ 浮条必须可点 */
+  z-index: 4;
+  white-space: nowrap;
+}
+
+/* 浮条按钮 */
+.ss-btn {
+  background: transparent;
+  border: none;
+  color: var(--text, #e9e9f0);
+  font-size: 13px;
+  font-family: inherit;
+  line-height: 1;
+  padding: 9px 12px;
+  border-radius: 7px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.ss-btn:hover,
+.ss-btn:active {
+  background: rgba(139, 124, 255, 0.22);
+}
+
+/* 窄屏：浮条按钮收紧，保证宽度够放 */
+@media (max-width: 480px) {
+  .ss-btn { padding: 9px 10px; font-size: 12.5px; }
+}

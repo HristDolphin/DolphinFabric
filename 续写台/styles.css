@@ -528,7 +528,13 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
 input[type=range]::-moz-range-track{height:6px;border-radius:3px;background:var(--line)}
 
 /* ============ 移动端（竖屏手机/窄窗口 ≤900px）：抽屉化 + 触控 ============ */
-@media (max-width: 900px){
+/* ★ 紧凑 UI 判定：窄屏 或 手机横屏。
+ * 原条件只有 max-width:900px（纯宽度，无横竖屏概念）→ 手机横屏时 CSS 宽度常升到 900+
+ *（932/960 等），整块失效 → 误用桌面三栏：左右栏变内联 300/330px 挤掉正文，
+ * 而底部生成区是全宽，横跨并把两侧下半截切掉（用户反馈的「底部遮挡两侧」）。
+ * 补 `(orientation:landscape) and (max-height:600px)`：手机横屏(360~550)命中；
+ * 笔记本/平板横屏(≥768)不命中，保持桌面三栏。与 app.js 的 isCompactUI() 保持一致。 */
+@media (max-width: 900px), (orientation:landscape) and (max-height:600px){
   /* 左：世界浏览器 → 覆盖式抽屉（transform 动画，替代桌面 display:none） */
   .sidebar.v2-panel{
     position:fixed;left:0;top:0;bottom:0;width:84vw;max-width:360px;z-index:45;
@@ -538,7 +544,13 @@ input[type=range]::-moz-range-track{height:6px;border-radius:3px;background:var(
   .sidebar.v2-panel:not(.open){display:flex}
   /* 20260916:原来锚在视口底部(bottom:100px),安卓呼出输入法时位置会变/被键盘盖住,
      使用者得先找位置再点 → 改为锚在顶部编辑器头之下,永不随键盘移动 */
-  .v2-collapsed-tab{top:100px;bottom:auto;width:30px;height:60px;z-index:46;border-radius:0 10px 10px 0}
+  /* 20261026:宽度 30→22(正文左缘 16px,故横向只压 6px,约为首字 1/3),并半透明幽灵化。
+   * 不再用「正文让出 gutter」方案 —— 那会让左侧 32px / 右侧 16px,布局不对称且挤占本就窄的正文。
+   * 编辑(打字)时进一步淡出并左移收窄,视觉上几乎不占字;此时靠左缘右滑手势召唤。 */
+  .v2-collapsed-tab{top:100px;bottom:auto;width:22px;height:60px;z-index:46;border-radius:0 10px 10px 0;
+    opacity:.5;transition:opacity .18s ease,transform .18s ease}
+  .v2-collapsed-tab:active{opacity:1}
+  body.editing .v2-collapsed-tab{opacity:.1;transform:translateX(-64%)}
   /* 右：世界设定 → 覆盖式抽屉 */
   .sidebar{
     position:fixed;right:0;top:0;bottom:0;width:84vw;max-width:360px;z-index:45;
@@ -630,7 +642,13 @@ input[type=range]::-moz-range-track{height:6px;border-radius:3px;background:var(
   #mobPageTitle{color:var(--accent)}
   /* 右抽屉折叠标签:收起时显示,展开时隐藏 */
   /* 20260916:同上,右侧「世界设定」标签同步改为顶部锚定,与左侧对称 */
-  .pool-tab{display:flex;top:100px;bottom:auto;width:30px;height:60px;border-radius:10px 0 0 10px;z-index:46}
+  /* 20261026:与左侧对称收窄 + 幽灵化,编辑时右移收窄。
+   * 选择器加 body 前缀提特异性 —— 文件末尾还有一条基础 .pool-tab{width:26px;top:14px},
+   * 同特异性且更靠后,会把这里的宽度/位置整条覆盖(实测 width 仍是 26px、top 仍是 14px)。 */
+  body .pool-tab{display:flex;top:100px;bottom:auto;width:22px;height:60px;border-radius:10px 0 0 10px;z-index:46;
+    opacity:.5;transition:opacity .18s ease,transform .18s ease}
+  body .pool-tab:active{opacity:1}
+  body.editing .pool-tab{opacity:.1;transform:translateX(64%)}
   #sidebar:not(.open) ~ .pool-tab.show{display:flex}
   #sidebar.open ~ .pool-tab{display:none}
   /* 抽屉滚动条隐藏(消除额外滑块宽度,左右视觉均匀) */
@@ -698,8 +716,8 @@ html.restore-universe .prompt-page, html.restore-prompt .prompt-page{animation:n
 #mobStylePop{width:min(320px,92vw);right:8px;padding:8px 10px 10px}
 #mobStylePop .btn{width:100%;margin-top:2px}
 
-/* ============ 横屏(landscape, ≤900px): 世界管理条目卡片单行化, 副触发词/逻辑进高级区 ============ */
-@media (orientation:landscape) and (max-width:900px){
+/* ============ 横屏紧凑: 世界管理条目卡片单行化, 副触发词/逻辑进高级区 ============ */
+@media (orientation:landscape) and (max-width:900px), (orientation:landscape) and (max-height:600px){
   .wm-wb-body .v2-curwb-entries{gap:4px}
   .wm-wb-body .wi-row{padding:3px 6px;margin-bottom:4px;border-radius:8px}
   .wm-wb-body .wi-main{gap:4px}
@@ -712,6 +730,48 @@ html.restore-universe .prompt-page, html.restore-prompt .prompt-page{animation:n
   .wm-wb-body .wi-pos{padding:2px 3px}
   .wm-wb-body .wi-more,.wm-wb-body .wi-del,.wm-wb-body .wi-ch{padding:2px 5px}
   .wm-wb-body .wi-detail{margin-top:3px;padding-top:3px;gap:6px}
+}
+
+/* ============ 横屏：底部生成区限高，把高度还给主区三栏 ============ */
+/* 原 .think-panel 固定 max-height:40vh。横屏(宽>高)时 40vh 占比过大,把 .main
+   三栏(左世界浏览器 / 右世界设定)压到极矮,左右信息被挤扁 → 视觉上「遮挡闭塞」。
+ * ★ 这里是「只要是横屏就生效」,不设高度阈值 —— 之前加了 max-height:720px 条件,
+ *   而平板横屏高度常为 768/834,条件不命中 → 规则完全不生效(表现:横屏毫无变化)。
+ * 竖屏保持原 40vh 不变。 */
+@media (orientation:landscape){
+  .think-panel{max-height:32vh}
+  .draft-text{min-height:88px}
+}
+/* 横屏紧凑(手机横放):左右抽屉原为 84vw,两个同开合计 168vw → 完全互相遮挡。
+ * 压到 48vw(合计 96vw),左右栏可同时可见,中间正文仍可点。
+ * 条件必须与上面「紧凑 UI」一致,否则手机横屏(宽 932 等)不命中。 */
+@media (orientation:landscape) and (max-width:900px), (orientation:landscape) and (max-height:600px){
+  .sidebar.v2-panel,.sidebar{width:min(48vw,320px)}
+}
+/* 矮横屏(手机横放 / 小尺寸平板):进一步压缩,并收紧各处竖向留白 */
+@media (orientation:landscape) and (max-height:640px){
+  .think-panel{max-height:26vh}
+  .draft-text{min-height:60px}
+  .draft-zone{padding:0 8px 6px}
+  .editor-head{padding:4px 10px}
+  .composer{padding:6px 10px calc(6px + env(safe-area-inset-bottom))}
+  .topbar{padding:4px 8px}
+}
+/* 极矮横屏(手机横放,~360-430px 高):底部只保留可用的预览条 */
+@media (orientation:landscape) and (max-height:460px){
+  .think-panel{max-height:24vh}
+  .draft-text{min-height:0;font-size:0.875rem;line-height:1.55}
+  .draft-actions .btn,.draft-actions .mini-btn{height:30px}
+  .draft-actions .mob-draft{height:30px;padding:0 10px}
+  /* 思考内容本就默认隐藏,横屏别再占位 */
+  .think-panel .tp-block{display:none}
+}
+/* 宽横屏平板(>900px 时左右栏是内联三栏,不是抽屉):收窄侧栏,给正文留宽。
+ * 用 pointer:coarse 限定触屏,避免误伤 1280x800 一类笔记本的既有布局。 */
+@media (orientation:landscape) and (pointer:coarse) and (min-width:901px) and (max-width:1280px){
+  .sidebar.v2-panel{width:240px}
+  .sidebar{width:260px}
+  .sidebar:not(.open){margin-right:-260px}
 }
 
 

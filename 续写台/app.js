@@ -791,6 +791,16 @@ function onModelSwitch(name, force){
   // 因此这里无需再套用风格参数(风格词仍由 effectiveSysPrompt / systemPromptParts 注入)。
 }
 
+/* 统一的模型切换入口:横屏 #modelSel 下拉与窄屏(≤900px)模型浮层共用。
+ * 为什么单独抽出来:窄屏浮层属"程序化切换",若直接调用 onchange() 就必须自己伪造事件对象,
+ * 一旦漏传事件参数,onchange 里的 e.target 会抛 TypeError,导致切换静默失败(本次修复的 BUG)。 */
+function applyModel(value){
+  if(!value) return;
+  state.model = value;
+  localStorage.setItem(LS_MODEL, state.model);
+  onModelSwitch(state.model);
+}
+
 /* ---------------- 思考块分离(DS R1 系 / 部分模型 inline <think>) ----------------
  * 思路:优先剥离成对的 <think>...</think>;对于流式"截到一半"未闭合的 <think>(模型还在吐推理、
  * 尚未输出 </think>),把"最后一个未闭合开标签之后的全部内容"也归入 think,避免正文区被 reasoning 污染。
@@ -1396,10 +1406,21 @@ function acceptDraft(){
  * 以前窄屏图标写死 🔳、title 还写着「思考面板」→ 语义误导。
  * 现在:窄屏 → ⬆/⬇「展开/收起预览区」;宽屏 → 🧠(思考) + ⬇/⬆(预览) 两个按钮不变。
  */
+/* ★ 统一「紧凑 UI」判定 = 窄屏 或 手机横屏。
+ * 原全项目只有 max-width:900px 一个宽度条件(无横竖屏概念)。问题:
+ * 手机竖屏 width 390~430 → 命中,走抽屉 UI(正常);
+ * 手机横屏 width 常升到 900+(932/960/844 等) → 不命中,被误判成「桌面三栏」,
+ *   左右侧栏变成内联 300/330px 挤掉正文,而底部生成区是 .app 全宽 → 横跨并把两侧下半截切掉。
+ * 故横屏补一条「高度 ≤600」:手机横屏(360~550)命中走抽屉 UI;
+ * 笔记本/平板横屏高度 ≥768 不命中,保持桌面三栏(不受影响)。
+ * CSS 侧的对应条件必须与此保持一致(styles.css 里 `(orientation:landscape) and (max-height:600px)`)。 */
+const COMPACT_MQ = "(max-width:900px), (orientation:landscape) and (max-height:600px)";
+function isCompactUI(){
+  try{ return window.matchMedia(COMPACT_MQ).matches; }catch(e){ return false; }
+}
 function previewPanelOpen(){ const p = el("thinkPanel"); return !!(p && p.classList.contains("open")); }
 function syncPreviewIcon(){
-  let mob = false;
-  try{ mob = window.matchMedia("(max-width:900px)").matches; }catch(e){ mob = false; }
+  const mob = isCompactUI();
   const t = el("toggleThink"), p = el("togglePreview"), open = previewPanelOpen();
   if(mob){
     if(t){
@@ -1768,7 +1789,7 @@ function bind(){
   el("viewReqBtn").onclick = showRequest;
   el("closeReq").onclick = ()=> el("reqSheet").classList.remove("open");
   el("reqSheet").onclick = e=>{ if(e.target===el("reqSheet")) el("reqSheet").classList.remove("open"); };
-  el("modelSel").onchange = e=>{ state.model = e.target.value; localStorage.setItem(LS_MODEL, state.model); onModelSwitch(state.model); };
+  el("modelSel").onchange = e=> applyModel(e.target.value);   // 统一入口,见 applyModel()
   el("styleSel").onchange = onStyleChange;
   el("curName").onchange = e=>{ if(V2.curChapter){ V2.curChapter.title = e.target.value; saveProjects(); renderV2ChapterBar(); renderProjectTabs(); } };
   el("editor").oninput = e=>{ if(V2.curChapter){ V2.curChapter.body = e.target.value; saveProjects(); el("charCount").textContent = e.target.value.length+" 字"; } };
@@ -1777,13 +1798,13 @@ function bind(){
   // 模式切换(续写 / 续笔)
   setMode(state.mode, false);
   el("modeSel").onchange = e=> setMode(e.target.value, true);
-  el("toggleThink").onclick = ()=>{ if(matchMedia("(max-width:900px)").matches) togglePreview(); else toggleThink(); };
+  el("toggleThink").onclick = ()=>{ if(isCompactUI()) togglePreview(); else toggleThink(); };
   el("togglePreview").onclick = togglePreview;
   el("togglePool").onclick = ()=>{ const _sb = el("sidebar"); _sb.classList.toggle("open"); wsMask(_sb.classList.contains("open")); };
 el("wsClose").onclick = ()=>{ el("sidebar").classList.remove("open"); wsMask(false); };
   el("poolTab").onclick = ()=>{ if(el("togglePool") && el("togglePool").onclick) el("togglePool").onclick(); };
 el("wsMask").onclick = ()=>{ el("sidebar").classList.remove("open"); wsMask(false); };
-function wsMask(show){ const _m = el("wsMask"); if(_m){ _m.style.display = (show && matchMedia("(max-width:900px)").matches) ? "block" : "none"; } }
+function wsMask(show){ const _m = el("wsMask"); if(_m){ _m.style.display = (show && isCompactUI()) ? "block" : "none"; } }
   el("toggleHistory").onclick = ()=> el("historyPanel").classList.toggle("open");
   el("clearThink").onclick = ()=>{ el("thinkText").textContent=""; el("draftText").textContent=""; };
   // 历史搜索 / 清空
@@ -1931,8 +1952,7 @@ function wsMask(show){ const _m = el("wsMask"); if(_m){ _m.style.display = (show
   // [已移除·20260916 用户要求] 提示词条目 UI 入口（功能与注入链路保留，仅去掉预设管理页的展示）
   // 恢复方式见 续写台/archives/remove_promptitems_20260916/REMOVED.md
   // const piAdd = el("piAdd"); if(piAdd) piAdd.onclick = addPromptItem;
-  // 开发者设置:在线 API 账号安全开关(默认开启,可关闭)
-  // 注:开关状态字段沿用 state.cfg.safeGate 以兼容既有本地配置,改字段名会让老用户开关状态丢失
+  // 开发者设置:在线过滤(SafeGate)开关
   const devSG = el("devAcctSafety");
   if(devSG){
     devSG.checked = state.cfg.safeGate !== false;
@@ -1941,7 +1961,7 @@ function wsMask(show){ const _m = el("wsMask"); if(_m){ _m.style.display = (show
       saveCfg();
       hideGateHint();   // 开关切换:隐藏残留提示
       renderSanitizeBtn();
-      v2Toast(devSG.checked ? "在线 API 账号安全已开启:⚠️标记条目等同关闭" : "在线 API 账号安全已关闭:⚠️条目恢复原设置", devSG.checked ? "ok" : "err");
+      v2Toast(devSG.checked ? "在线过滤已开启:在线模式下⚠️条目等同关闭" : "在线过滤已关闭:⚠️条目恢复原设置", devSG.checked ? "ok" : "err");
     };
   }
   // 词库管理:转化入口
@@ -2032,16 +2052,17 @@ async function gotoWbEditor(wbid){
   V2._curWbId = wbid;   // 渲染前设好,renderWorldBookEditor 直接选中
   const btn = document.querySelector('.page-nav-btn[data-page="universe"]');
   if(btn) btn.click();
-  if(window.matchMedia("(max-width:900px)").matches){
+  if(isCompactUI()){
     const tw = el("wmTabWb"); if(tw) tw.click();   // 窄屏:确保停在 WorldBook 编辑 tab
   }
   v2Toast("已打开 WorldBook 编辑", "ok");
 }
 
+
 /* 移动端:点击正文区收回打开的抽屉(左世界浏览器/右设定池) - 下意识操作 */
 function bindDismissDrawers(){
   document.addEventListener("pointerdown", (e)=>{
-    if(!matchMedia("(max-width:900px)").matches) return;
+    if(!isCompactUI()) return;
     const ed = el("editor");
     if(!ed || !ed.contains(e.target)) return;
     const lp = el("v2WorldPanel"), rp = el("sidebar");
@@ -2050,6 +2071,111 @@ function bindDismissDrawers(){
     if(rp && rp.classList.contains("open")){ rp.classList.remove("open"); closed = true; }
     if(closed) e.preventDefault();   // 本次点击只收抽屉,不唤起输入法
   }, true);
+}
+
+/* ---------------- 边缘滑动召唤抽屉(横竖屏通用) ----------------
+ * 左缘向右滑 → 世界浏览器;右缘向左滑 → 世界设定。抽屉跟手拉出,松手按位移判定开/合。
+ *
+ * 设计要点(为什么这样写):
+ * 1) 不做常驻热区 div —— 左缘是 textarea 可编辑区,热区会抢「点行首定位光标」。
+ *    改为 document 级监听:touchstart 只「记录起点」一律放行,超过阈值才 preventDefault 接管。
+ * 2) 方向锁 —— 横向位移必须大于纵向 1.4 倍才认定为横滑,否则交还浏览器做竖向滚动,
+ *    避免上下滚正文时误把抽屉拽出来。
+ * 3) 只在紧凑布局(isCompactUI:窄屏或手机横屏)启用;桌面三栏没有抽屉概念。
+ * 4) 抽屉已开时不接管 —— 关闭沿用 bindDismissDrawers(点正文)与遮罩,不再加第二个手势。
+ * 5) 系统返回手势:边缘右滑在 iOS Safari 标签页/Android 手势导航下是「后退」,JS 拦不住。
+ *    ★ Android 原生壳(D4C)必须完全禁用 —— 壳的 MainActivity.onBackPressed 直接
+ *      super.onBackPressed() 退出 APP(无二次确认,见 D:\xietai_android MainActivity.kt:151),
+ *      而系统返回手势的起手区正好是屏幕左右边缘,与这里的热区 26px 完全重叠。
+ *      一旦冲突,误滑一次就是整个 APP 被关掉,数据虽已保存但正在写的段落会中断。
+ *      壳里改用头部那对 22px 半透明竖条(» / 📖)打开抽屉,不依赖手势。
+ *     PWA 独立窗口(display:standalone)无系统返回手势,可正常使用。
+ */
+function bindEdgeSwipe(){
+  // Android 原生壳:禁用(边缘是系统返回区,而壳的返回=直接退出 APP)
+  if(window.native) return;
+  const EDGE = 26;      // 起手热区宽度(px)
+  const COMMIT = 12;    // 横向位移阈值(px),未超过则完全放行
+  const RATIO = 1.4;    // 方向锁:横向需大于纵向的倍数
+  const KEEP = 0.33;    // 松手时越过抽屉宽度的比例即判定为「开」
+  let st = null;
+
+  const mask = show => { const m = el("wsMask"); if(m) m.style.display = (show && isCompactUI()) ? "block" : "none"; };
+
+  document.addEventListener("touchstart", (e)=>{
+    if(!isCompactUI()) return;
+    if(!e.touches || e.touches.length !== 1) return;   // 多指(缩放)不接管
+    const lp = el("v2WorldPanel"), rp = el("sidebar");
+    if(!lp || !rp) return;
+    const x = e.touches[0].clientX, vw = window.innerWidth;
+    let side = null;
+    if(!lp.classList.contains("open") && x <= EDGE) side = "left";
+    else if(!rp.classList.contains("open") && x >= vw - EDGE) side = "right";
+    if(!side) return;
+    st = { side, x0:x, y0:e.touches[0].clientY, locked:false, dx:0, panel: side === "left" ? lp : rp, w:0 };
+  }, { passive:true });
+
+  document.addEventListener("touchmove", (e)=>{
+    if(!st) return;
+    const t = e.touches[0];
+    const dx = (st.side === "left" ? 1 : -1) * (t.clientX - st.x0);
+    const dy = t.clientY - st.y0;
+    if(!st.locked){
+      if(Math.abs(dy) > Math.abs(dx)){ st = null; return; }        // 竖滑 → 不接管
+      if(dx <= COMMIT || dx <= Math.abs(dy) * RATIO) return;       // 未达阈值,继续放行
+      st.locked = true;
+      st.w = st.panel.getBoundingClientRect().width || 280;
+      st.panel.style.transition = "none";
+      // 清掉可能已产生的文字选区(否则会边拉抽屉边拖出选词高亮)
+      try{
+        const ed = el("editor");
+        if(ed && typeof ed.selectionStart === "number"){ ed.selectionStart = ed.selectionEnd; }
+        if(window.getSelection) window.getSelection().removeAllRanges();
+      }catch(_){ }
+    }
+    e.preventDefault();                                            // 锁定后才阻止默认(阻断回弹滚动)
+    const p = Math.min(dx, st.w);
+    st.dx = p;
+    const off = st.w - p;
+    st.panel.style.transform = st.side === "left" ? `translateX(${-off}px)` : `translateX(${off}px)`;
+  }, { passive:false });
+
+  const finish = ()=>{
+    if(!st || !st.locked){ st = null; return; }
+    const { side, dx, w, panel } = st;
+    st = null;
+    const open = dx > w * KEEP;
+    // 从当前拖到的位置动画到终态(不能直接清 transform,否则会跳变)
+    panel.style.transition = "transform .2s ease";
+    panel.style.transform = open
+      ? "translateX(0)"
+      : (side === "left" ? "translateX(-100%)" : "translateX(100%)");
+    setTimeout(()=>{
+      panel.style.transition = "";
+      panel.style.transform = "";
+      if(open){
+        panel.classList.add("open");
+        if(side === "right") mask(true);
+      }
+    }, 210);
+  };
+  document.addEventListener("touchend", finish, { passive:true });
+  document.addEventListener("touchcancel", finish, { passive:true });
+}
+
+/* 编辑态标记:打字时把左右竖条淡出收窄(见 styles.css body.editing 规则),
+ * 停止输入 1.4s 或失焦后恢复 —— 让竖条不长期压住正文首字。 */
+function bindEditingHint(){
+  const ed = el("editor");
+  if(!ed) return;
+  let timer = null;
+  const mark = ()=>{
+    document.body.classList.add("editing");
+    if(timer) clearTimeout(timer);
+    timer = setTimeout(()=> document.body.classList.remove("editing"), 1400);
+  };
+  ed.addEventListener("input", mark, { passive:true });
+  ed.addEventListener("blur", ()=>{ if(timer) clearTimeout(timer); document.body.classList.remove("editing"); });
 }
 /* 移动端浮层:页面菜单(汉堡) + 模型选择 */
 function bindMobPopups(){
@@ -2068,7 +2194,10 @@ function bindMobPopups(){
       mPop.style.display = mPop.style.display === "block" ? "none" : "block";
     };
     mPop.onclick = e=>{ const b = e.target.closest("button[data-m]"); if(!b) return; const sel = el("modelSel");
-      if(sel){ sel.value = b.dataset.m; if(sel.onchange) sel.onchange(); }
+      // 修(bug):原先 `sel.onchange()` 未传事件对象 → 处理器内 e.target 抛 TypeError → 窄屏切换静默失败。
+      // 现改为:先同步原生下拉的显示值,再走统一入口 applyModel(),不再依赖事件对象。
+      if(sel) sel.value = b.dataset.m;
+      applyModel(b.dataset.m);
       mPop.style.display = "none";
     };
   }
@@ -2154,12 +2283,32 @@ function updateMobPageTitle(){
 }
 /* 移动端布局搬运:模式选择→标题行;全局按钮→顶栏(双向,跨断点复原) */
 function mobLayout(){
-  const mob = matchMedia("(max-width:900px)").matches;
+  const mob = isCompactUI();
   // 竖屏默认收起世界浏览器(仅首次窄屏,用户手动展开后不再干预)
   const wbPanel = el("v2WorldPanel");
   if(mob && wbPanel && wbPanel.dataset.guideInit === undefined){
     wbPanel.dataset.guideInit = "1";
     wbPanel.classList.remove("open");
+  }
+  /* ★ 底部生成区宽度必须跟随正文列(用户指出的优先级问题):
+   * 桌面三栏时,左右侧栏会压缩正文列宽度,但 #thinkPanel/.composer 原本是 .app 的全宽子元素,
+   * 宽度不随两侧变化 → 横跨左右栏下方,视觉上把两侧栏下半截「切掉」(遮挡闭塞)。
+   * 现改为:宽屏把「预览区 + 底栏」搬进 .editor-wrap(与正文同列,宽度自动随侧栏伸缩,
+   * 左右侧栏因此贯穿到底);紧凑 UI(侧栏是覆盖式抽屉)时搬回 .app 占满全宽。
+   * 注意:thinkPanel 必须排在 composer 之前 —— CSS `.think-panel.open ~ .composer #genBtn` 依赖兄弟顺序。 */
+  const appEl = document.querySelector(".app"), ew = document.querySelector(".editor-wrap");
+  const tp = el("thinkPanel"), cmpEl = document.querySelector(".composer");
+  if(appEl && ew && tp && cmpEl){
+    if(mob){
+      if(tp.parentNode !== appEl){
+        if(cmpEl.parentNode === appEl) appEl.insertBefore(tp, cmpEl);
+        else appEl.appendChild(tp);
+      }
+      if(cmpEl.parentNode !== appEl) appEl.appendChild(cmpEl);
+    } else {
+      if(tp.parentNode !== ew) ew.appendChild(tp);
+      if(cmpEl.parentNode !== ew) ew.appendChild(cmpEl);
+    }
   }
   const seg = el("modeSeg"), gb = el("v2GlobalBtn"), cur = el("curName");
   if(!seg || !gb || !cur) return;
@@ -2182,6 +2331,8 @@ async function init(){
   applyFontScale(state.cfg.fontScale || 1);
   mobLayout();
   bindDismissDrawers();
+  bindEdgeSwipe();
+  bindEditingHint();
   bindMobPopups();
   bindWmTabs();
   updateMobPageTitle();
@@ -2604,10 +2755,16 @@ function renderWorldBrowser(){
   const matchC = c => !q || (c.title||"").toLowerCase().includes(q);
 
   let html = "";
+  /* 渲染时把每个节点「本次实际生效的展开态」缓存下来,供点击回调取反。
+   * 不要在回调里重新推导 fallback(如 ws.length===1) —— ws 是循环内局部变量,
+   * 回调里取不到会抛 ReferenceError,表现为点击完全无反应。 */
+  const renderedOpen = {};
+  const markOpen = (type, id, open) => { renderedOpen[type + ":" + id] = open; };
   for(const u of V2.universes){
     if(!matchU(u)) continue;
-    const uOpen = V2.openUniverses[u.id] || (V2.universes.length === 1 && !q);
+    const uOpen = v2TreeOpen(V2.openUniverses, u.id, V2.universes.length === 1 && !q);
     const selU = sel().universe === u.id;
+    markOpen("world", u.id, uOpen);
     html += nodeHtml("world", u.id, "🌐", (u.name||"未命名") + (q ? "" : " 宇宙"), (u.worldBookIds||[]).length + "书", uOpen, selU);
     if(uOpen){
       const ws = (V2.works || []).filter(w => (w.universeId||"") === u.id);
@@ -2615,8 +2772,9 @@ function renderWorldBrowser(){
       if(ws.length === 0) child = `<div class="v2-node chapter" style="opacity:.6">(无作品集)</div>`;
       for(const w of ws){
         if(!matchW(w)) continue;
-        const wOpen = V2.openWorks[w.id] || (ws.length === 1 && !q);
+        const wOpen = v2TreeOpen(V2.openWorks, w.id, ws.length === 1 && !q);
         const selW = sel().work === w.id;
+        markOpen("project", w.id, wOpen);
         child += nodeHtml("project", w.id, "📚", w.name, (w.chapterIds||[]).length + "章", wOpen, selW);
         if(wOpen){
           const chs = (V2.chaptersCache || {})[w.id] || [];
@@ -2641,13 +2799,14 @@ function renderWorldBrowser(){
     n.onclick = (ev)=>{
       ev.stopPropagation();
       const type = n.dataset.type, id = n.dataset.id;
+      // 取渲染时记录的实际展开态再取反 → 单宇宙/单作品也能真正收起(不再被 fallback 覆盖)
+      const wasOpen = renderedOpen[type + ":" + id] === true;
+      const open = !wasOpen;
       if(type === "world"){
-        const open = !V2.openUniverses[id];
         V2.openUniverses[id] = open;
         if(open){ onSelectUniverse(id); }
         renderWorldBrowser();
       } else if(type === "project"){
-        const open = !V2.openWorks[id];
         V2.openWorks[id] = open;
         if(open){ onSelectWork(id); }
         renderWorldBrowser();
@@ -2665,6 +2824,12 @@ function nodeHtml(type, id, icon, name, count, open, selected){
     ${count?`<span class="vn-count">${esc(String(count))}</span>`:""}
   </div>`;
 }
+/* 树节点展开态：区分「从未设置」(用 fallback 自动展开) 与「用户显式收起」(尊重 false)。
+ * 修复:原 `map[id] || fallback` 在单宇宙/单作品时,会把用户刚点的收起(false)再次覆盖成展开,
+ * 表现为「点折叠没反应 / 收起后立即又展开」。 */
+function v2TreeOpen(map, id, fallback){
+  return (id in map) ? map[id] : fallback;
+}
 /* 页面左栏:WorldBook 编辑(工具栏 + 条目列表 + 放大编辑) */
 /* ============ 世界管理页:WorldBook 编辑(左栏) ============ */
 function renderWorldBookEditor(body){
@@ -2672,14 +2837,16 @@ function renderWorldBookEditor(body){
   const allWbs = (V2.worldBooks && V2.worldBooks.length)
     ? V2.worldBooks
     : (Object.keys(V2.wbCache).map(id=>({ id, name: (V2.wbCache[id]&&V2.wbCache[id].name)||id })));
-  if(!V2._curWbId || !allWbs.some(w=>w.id===V2._curWbId)){
-    V2._curWbId = allWbs.length ? allWbs[0].id : null;
+  // 默认不选中任何世界书(原实现在此自动选中第一本 → 表现为"默认已展开第一本、点它无反应、
+  // 要切走再切回")。现仅在当前指向的世界书已不存在时置空,防止 _curWbId 悬空。
+  if(V2._curWbId && !allWbs.some(w=>w.id===V2._curWbId)){
+    V2._curWbId = null;
   }
   const curWb = (V2._curWbId && V2.wbCache[V2._curWbId]) || null;
   let html = "";
   // -- 世界书操作常驻按钮排(WorldBook▼ 全库) --
   html += `<div class="v2-wb-toolbar">
-    <select id="v2WbSel" title="选择任意世界书(全库),下方列出其条目">${allWbs.map(w=>`<option value="${esc(w.id)}" ${w.id===V2._curWbId?"selected":""}>${esc(w.name||w.id)}</option>`).join("")||"<option value=''>(无)</option>"}</select>
+    <select id="v2WbSel" title="选择任意世界书(全库),下方列出其条目"><option value="" ${V2._curWbId?"":"selected"}>(未选择世界书)</option>${allWbs.map(w=>`<option value="${esc(w.id)}" ${w.id===V2._curWbId?"selected":""}>${esc(w.name||w.id)}</option>`).join("")}</select>
     <button class="mini-btn v2-wb-rename" ${curWb?"":"disabled"} title="重命名当前世界书">改名</button>
     <button class="mini-btn v2-wb-newentry" ${curWb?"":"disabled"} title="在当前世界书新建条目">新建条目</button>
     <button class="mini-btn v2-wb-del" ${curWb?"":"disabled"} title="删除当前世界书(从所有宇宙引用与全局激活中移除,不可恢复)">删除</button>
@@ -2699,6 +2866,8 @@ function renderWorldBookEditor(body){
   if(curWb){
     const entries = sortEntriesForDisplay(entriesToArray(curWb.entries));
     html += `<div class="v2-curwb-entries">${entries.map(([k,e])=>entryCardHtml(curWb.id, k, e, false)).join("") || `<div class="v2-empty">该世界书无条目</div>`}</div>`;
+  } else if(allWbs.length){
+    html += `<div class="v2-empty">(未选择世界书:请从上方下拉或左侧列表选择一本)</div>`;
   } else {
     html += `<div class="v2-empty">(世界书库为空,点「📥 导入」或「新建」)</div>`;
   }
@@ -2809,8 +2978,10 @@ function renderWorldSettings(){
   const allWbs = (V2.worldBooks && V2.worldBooks.length)
     ? V2.worldBooks
     : (Object.keys(V2.wbCache).map(id=>({ id, name: (V2.wbCache[id]&&V2.wbCache[id].name)||id })));
-  if(!V2._curWbId || !allWbs.some(w=>w.id===V2._curWbId)){
-    V2._curWbId = allWbs.length ? allWbs[0].id : null;
+  // 默认不选中任何世界书(原实现在此自动选中第一本 → 表现为"默认已展开第一本、点它无反应、
+  // 要切走再切回")。现仅在当前指向的世界书已不存在时置空,防止 _curWbId 悬空。
+  if(V2._curWbId && !allWbs.some(w=>w.id===V2._curWbId)){
+    V2._curWbId = null;
   }
   const curWb = (V2._curWbId && V2.wbCache[V2._curWbId]) || null;
   html += `<div class="v2-sec-title v2-uni-toggle" id="v2UniToggle">${uniOpen?"▾":"▸"} 宇宙信息</div>`;
@@ -2835,7 +3006,7 @@ function renderWorldSettings(){
 
   // -- 世界书操作常驻按钮排(WorldBook▼ 全库) --
   html += `<div class="v2-wb-toolbar">
-    <select id="v2WbSel" title="选择任意世界书(全库),下方列出其条目">${allWbs.map(w=>`<option value="${esc(w.id)}" ${w.id===V2._curWbId?"selected":""}>${esc(w.name||w.id)}</option>`).join("")||"<option value=''>(无)</option>"}</select>
+    <select id="v2WbSel" title="选择任意世界书(全库),下方列出其条目"><option value="" ${V2._curWbId?"":"selected"}>(未选择世界书)</option>${allWbs.map(w=>`<option value="${esc(w.id)}" ${w.id===V2._curWbId?"selected":""}>${esc(w.name||w.id)}</option>`).join("")}</select>
     <button class="mini-btn v2-wb-rename" ${curWb?"":"disabled"} title="重命名当前世界书">改名</button>
     <button class="mini-btn v2-wb-newentry" ${curWb?"":"disabled"} title="在当前世界书新建条目">新建条目</button>
     <span class="tb-sep">|</span>
@@ -2853,6 +3024,8 @@ function renderWorldSettings(){
   if(curWb){
     const entries = sortEntriesForDisplay(entriesToArray(curWb.entries));
     html += `<div class="v2-curwb-entries">${entries.map(([k,e])=>entryCardHtml(curWb.id, k, e, true)).join("") || `<div class="v2-empty">该世界书无条目</div>`}</div>`;
+  } else if(allWbs.length){
+    html += `<div class="v2-empty">(未选择世界书:请从上方下拉或左侧列表选择一本)</div>`;
   } else {
     html += `<div class="v2-empty">(世界书库为空,点「📥 导入」或「新建」)</div>`;
   }
@@ -3147,8 +3320,8 @@ async function wbDeleteCurrent(){
     }
   }
   if(V2._curWbId === wb.id){
-    const rest = V2.worldBooks||[];
-    V2._curWbId = rest.length ? rest[0].id : null;
+    // 用户拍板:删除当前编辑的世界书后直接回到空态(不再自动选中剩余的第一本)
+    V2._curWbId = null;
   }
   renderWorldSettings();
   renderWorldBrowser();
@@ -3455,6 +3628,7 @@ async function onSelectWork(id){
  * 从本地列表/缓存/作品 chapterIds 中剔除,并自动选中下一个可用章节,
  * 避免反复 404 且"点击无反应"。网络错误(非 404)不剔除,仅提示。 */
 async function onSelectChapter(id){
+  if(window.xietaiSel) window.xietaiSel.clear();   // 切章节清空自绘选区
   V2.selection.chapter = id;
   if(!V2.curWork) return;
   const ch = await loadChapter(V2.curWork.id, id)
@@ -3708,7 +3882,7 @@ function renderV2GlobalSheet(){
 async function linkGlobalToUniverse(wbid){
   V2._curWbId = wbid;
   if(!V2.wbCache[wbid]){ try{ await loadWorldBook(wbid); }catch(e){} }
-  if(window.matchMedia("(max-width:900px)").matches){
+  if(isCompactUI()){
     // 窄屏:转跳到世界管理 → WorldBook 编辑
     gotoWbEditor(wbid);
   } else {
@@ -4131,7 +4305,7 @@ function bindV2(){
   if(el("mobChapterClose")) el("mobChapterClose").onclick = closeMobChapterSheet;
   const mcs = el("mobChapterSheet"); if(mcs) mcs.onclick = e=>{ if(e.target === mcs) closeMobChapterSheet(); };
   // 移动端:缩短长控件文案(指令占位符)
-  if(matchMedia("(max-width:900px)").matches){
+  if(isCompactUI()){
     const _ins = el("instruction");
     if(_ins) _ins.placeholder = "续写指令(可选)";
   }
