@@ -4,6 +4,15 @@
 
 简约本地小说续写台 —— 适配 SillyTavern 生态的小说生成器：支持ollmam和在线API，WorldBook一键植入，自带Python环境。
 
+## 下载
+
+**Windows / Android 客户端都在本页右侧的 [Releases](https://github.com/HristDolphin/DolphinFabric/releases/latest) 栏下载**，取最新一版即可：
+
+- `DolphinFabric.win-<版本>.zip` —— Windows 版，解压后双击 `启动_续写台.bat`（自带便携 Python，无需安装环境）
+- `DolphinFabric-D4C-<版本>.apk` —— Android 客户端，覆盖安装即可，原有数据与已保存的密钥保留
+
+当前版本：PC **26.67.11** ／ D4C **1.0.4**
+
 ## 特性
 
 - **三模式续写**：支持chat/complete/completion多模式
