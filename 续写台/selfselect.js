@@ -423,12 +423,19 @@
     /* 只有「真的有区间」时才画手柄。
      * 非选择状态（anchor === focus）不画任何手柄，只留 textarea 自己的原生光标 ——
      * 用户反馈「非选择状态的光标跟原生不一样」，原生光标由 syncNative() 定位，
-     * 外观交给系统，视觉上才一致。 */
+     * 外观交给系统，视觉上才一致。
+     *
+     * ★ 必须对 posOf 的返回值判空：端点字符若恰好取不到 rects
+     * （换行符边界、索引越界、镜像尚未布局完），posOf 会返回 null，
+     * 直接丢给 placeHandle 会抛 TypeError 让整个 render 中断。
+     * 此时宁可不画对应手柄，也不能让高亮与浮条一起失效。 */
     if (active) {
-      if (S.anchor > S.focus) { placeHandle(hStart, pf); placeHandle(hEnd, pa); }
-      else { placeHandle(hStart, pa); placeHandle(hEnd, pf); }
-      hStart.style.display = 'block';
-      hEnd.style.display = 'block';
+      const sPos = (S.anchor > S.focus) ? pf : pa;
+      const ePos = (S.anchor > S.focus) ? pa : pf;
+      if (sPos) { placeHandle(hStart, sPos); hStart.style.display = 'block'; }
+      else hStart.style.display = 'none';
+      if (ePos) { placeHandle(hEnd, ePos); hEnd.style.display = 'block'; }
+      else hEnd.style.display = 'none';
     }
 
     if (active) showBar(start, end);
@@ -646,11 +653,32 @@
     }
 
     if (id === 'selectAll') {
+      /* 全选的两个约束，必须同时满足：
+       *   1) 要让输入法有输入目标 → 必须 focus 并放置原生光标；
+       *   2) 视图不能跳走 → 光标绝不能放在文末。
+       * 早期把光标设在 value.length（文末），WebView 认为「光标在结尾」，
+       * 于是自动滚到底部（实测 scrollTop 528 → 7929），用户眼前突然变成文章结尾。
+       * 做法：把光标放到「当前视口顶部附近对应的字符」，视图原地不动；
+       * 真正的替换/删除区间由 beforeinput 桥临时切成 [0, len]。 */
+      const keepTop = ed.scrollTop;
       S.anchor = 0;
       S.focus = ed.value.length;
-      /* 不调用 syncNative：那会把原生光标收到末尾并让视图滚到底部。
-       * 全选只需视觉高亮，光标留在原处即可。 */
+
+      Mirror.refreshIfNeeded();
+      const cs = getComputedStyle(ed);
+      const padT = parseFloat(cs.paddingTop) || 0;
+      let caret = Mirror.charAtY(Math.max(0, keepTop - padT));
+      caret = Math.max(0, Math.min(caret, ed.value.length));
+
+      nativeSetting = true;
+      try { ed.setSelectionRange(caret, caret); } catch (e) { }
+      nativeSetting = false;
+      nativeMark = { a: caret, b: caret, t: Date.now() };
+
+      try { if (document.activeElement !== ed) ed.focus({ preventScroll: true }); } catch (e) { }
+      ed.scrollTop = keepTop;
       render();
+      requestAnimationFrame(() => { ed.scrollTop = keepTop; render(); });
       toast('已全选 ' + ed.value.length + ' 字');
       return;
     }
@@ -710,13 +738,59 @@
    *  2) 打字/输入法候选上屏会插到那个旧位置，而不是用户看到的光标处。
    * 这里始终把原生选区收成「焦点端的折叠光标」：既能显示正确的原生光标外观，
    * 又不会因为是非折叠区间而触发系统选区手柄与 ActionMode。 */
+  /* ★ 同步原生选区
+   * 这里有一个必须两头兼顾的矛盾：
+   *   A. 原生选区若是「折叠光标」→ 系统不画自己的 selection handle，视觉干净；
+   *      但 Chromium 只看到一个光标点，打字不会替换选区、退格只删一个字。
+   *   B. 原生选区若是「真实区间」→ 打字/退格/粘贴天然正确；
+   *      但 Android 会在两端绘制系统自带的蓝色 handle（实测起点 475px、终点 758px
+   *      的 (64,96,160) 像素），与我们紫色自绘手柄重叠成双份，很难看。
+   *
+   * 解法：平时保持折叠光标（视觉干净），**只在输入动作发生前的一瞬间**切换成真实区间
+   * （见 bindNativeEditBridge 里的 beforeinput），让浏览器按真实区间执行替换/删除，
+   * 输入完成后再退回折叠。这样两者兼得。
+   */
+  let nativeSetting = false;   // 标记「正在由本模块写原生选区」，避免被自身的 change 监听当成用户操作
+  /* ★ selectionchange 是异步派发的，等它到达时 nativeSetting 早已复位，
+   * 所以不能只靠那个同步标志。这里额外记录「我们最近一次写入的值 + 时间」，
+   * 让 selectionchange 能识别出「这次变化是我自己造成的」。 */
+  let nativeMark = null;
+
   function syncNative(keepScroll) {
     if (!ed) return;
     const idx = (S.focus >= 0) ? S.focus : S.anchor;
     if (idx < 0) return;
     const st = ed.scrollTop;
+    nativeSetting = true;
     try { ed.setSelectionRange(idx, idx); } catch (e) { }
+    nativeSetting = false;
+    nativeMark = { a: idx, b: idx, t: Date.now() };
     if (keepScroll !== false && ed.scrollTop !== st) ed.scrollTop = st;
+  }
+
+  /* ★ 输入桥：把「自绘选区」翻译成一次原生的区间编辑
+   * 在 beforeinput（输入动作提交前）把原生选区临时改成真实区间，
+   * 浏览器随后执行默认动作时就会替换/删除整段。不 preventDefault，
+   * 所以输入法组词、候选上屏、表情插入等都由 Chromium 原生处理，中文不会被破坏。 */
+  function bindNativeEditBridge() {
+    const RANGE_INPUTS = {
+      insertText: 1, insertCompositionText: 1, insertFromPaste: 1, insertFromDrop: 1,
+      deleteContentBackward: 1, deleteContentForward: 1,
+      deleteByCut: 1, deleteWordBackward: 1, deleteWordForward: 1,
+      deleteSoftLineBackward: 1, deleteSoftLineForward: 1
+    };
+    ed.addEventListener('beforeinput', (e) => {
+      const active = S.anchor >= 0 && S.focus >= 0 && S.anchor !== S.focus;
+      if (!active) return;
+      if (!RANGE_INPUTS[e.inputType]) return;         // 选择类/格式类操作不在此处理
+      const a = Math.min(S.anchor, S.focus);
+      const b = Math.max(S.anchor, S.focus);
+      if (ed.selectionStart === a && ed.selectionEnd === b) return;   // 已经是区间了
+      nativeSetting = true;
+      try { ed.setSelectionRange(a, b); } catch (er) { }
+      nativeSetting = false;
+      /* 不阻止默认：浏览器紧接着会按这个区间执行插入/删除 */
+    }, true);
   }
 
   function onTouchStart(e) {
@@ -835,8 +909,10 @@
     S.longPressed = false;
 
     if (wasDragging) {
-      // 拖动结束：把手柄端点的位置同步给原生光标，随后再显示浮条
+      // 拖动结束：把手柄端点的位置同步给原生选区，随后再显示浮条
       syncNative();
+      /* 必须有焦点，否则打字不会替换选区（输入法没有输入目标） */
+      try { if (document.activeElement !== ed) ed.focus({ preventScroll: true }); } catch (e) { }
       if (S.anchor >= 0 && S.focus >= 0 && S.anchor !== S.focus) {
         render();
       } else if (S.anchor >= 0) {
@@ -872,7 +948,9 @@
       if (isDouble) {
         const rg = sentenceRangeAt(idx);
         S.anchor = rg.start; S.focus = rg.end;
-        syncNative();          // 折叠到焦点端，避免系统手柄
+        /* 双击选句也同步真实区间：与原生习惯一致，双击后可直接打字替换整句 */
+        syncNative();
+        try { if (document.activeElement !== ed) ed.focus({ preventScroll: true }); } catch (er) { }
       } else {
         S.anchor = idx; S.focus = idx;
         /* ★ 先把原生光标放到 idx 再 focus：避免 Android 滚到旧光标位置 */
@@ -1103,6 +1181,26 @@
       if (selfEdit) return;             // 本模块发起的改动，选区已单独处理
       if (S.anchor >= 0) { S.anchor = -1; S.focus = -1; render(); }
     }, { passive: true });
+
+    /* ★ 光标被外部移动 → 放弃自绘选区，回到普通编辑
+     * 覆盖这些入口：点击定位、键盘方向键、输入法候选上屏后移动光标、粘贴后跳转。
+     * 判定方式：原生选区与本模块记录的选区不一致，且不是我们自己在写（nativeSetting）、
+     * 也不在拖选过程中，就认为用户「用光标重新定位了」，清掉高亮与手柄。
+     * 这就是用户要的「光标左右移动能重置选择、恢复正常编辑」。 */
+    document.addEventListener('selectionchange', () => {
+      if (!ed || nativeSetting || S.dragging) return;
+      if (S.anchor < 0 && S.focus < 0) return;         // 本来就没有自绘选区
+      const a = ed.selectionStart, b = ed.selectionEnd;
+      /* 是我刚写入的那个折叠光标 → 忽略（否则拖选一结束就会被自己清掉） */
+      if (nativeMark && a === nativeMark.a && b === nativeMark.b && (Date.now() - nativeMark.t) < 800) return;
+      const myA = Math.min(S.anchor, S.focus >= 0 ? S.focus : S.anchor);
+      const myB = Math.max(S.anchor, S.focus >= 0 ? S.focus : S.anchor);
+      if (a === myA && b === myB) return;              // 一致 → 是我们期望的状态
+      S.anchor = -1; S.focus = -1;
+      nativeMark = null;
+      hideBar();
+      render();
+    }, { passive: true });
     /* 滚动时重绘高亮：只走合帧渲染。
      * 不再在这里直接调 syncLayerBox() —— 那会每次滚动都做两次 getBoundingClientRect
      * 强制同步布局，是掉帧的隐形来源。render() 内部本身会 syncLayerBox()。 */
@@ -1112,13 +1210,21 @@
       window.visualViewport.addEventListener('resize', () => { syncLayerBox(); if (S.anchor >= 0) render(); });
     }
 
+    // 让打字 / 退格 / 粘贴按「自绘选区」执行（临时把原生选区切成真实区间）
+    bindNativeEditBridge();
+
     S.inited = true;
 
     /* 对外接口：返回选中的词，供后续定向处理扩展 */
     window.xietaiSel = {
       get text() { return (S.anchor >= 0 && S.anchor !== S.focus) ? ed.value.slice(Math.min(S.anchor, S.focus), Math.max(S.anchor, S.focus)) : ''; },
       get range() { return (S.anchor >= 0 && S.anchor !== S.focus) ? { start: Math.min(S.anchor, S.focus), end: Math.max(S.anchor, S.focus) } : null; },
-      set(a, b) { S.anchor = a; S.focus = b; render(); },
+      set(a, b) {
+        /* 夹到合法范围：越界索引会让镜像取不到矩形，手柄/高亮失效 */
+        const n = ed.value.length;
+        const cl = v => Math.max(0, Math.min(Number(v) || 0, n));
+        S.anchor = cl(a); S.focus = cl(b); render();
+      },
       clear() { S.anchor = S.focus = -1; S.dragging = null; render(); },
       rerender() { Mirror.cachedVal = null; render(); },
       /** 调试/外部定位用：字符偏移 → 内容坐标 y（相对镜像内容区原点） */
